@@ -9,9 +9,9 @@ const KEEPALIVE_PERIOD_MINUTES = 0.5;
 const DEFAULT_VARIATIONAL_URL = "https://omni.variational.io/";
 
 const DEFAULT_CONFIG = {
-  wsEndpoint: "ws://127.0.0.1:8766",
-  restEndpoint: "ws://127.0.0.1:8767",
-  commandEndpoint: "ws://127.0.0.1:8768",
+  wsEndpoint: "ws://127.0.0.1:8866",
+  restEndpoint: "ws://127.0.0.1:8867",
+  commandEndpoint: "ws://127.0.0.1:8868",
   domainFilter: "variational",
   restAllowlist: [
     "https://omni.variational.io/api/"

@@ -39,9 +39,9 @@ def utc_now() -> str:
 @dataclass(slots=True)
 class ListenerConfig:
     host: str = "127.0.0.1"
-    ws_port: int = 8766
-    rest_port: int = 8767
-    command_port: int = 8768
+    ws_port: int = 8866
+    rest_port: int = 8867
+    command_port: int = 8868
     output_dir: Path | None = None
     quiet: bool = False
     monitor: bool = True
@@ -1454,9 +1454,9 @@ async def run(config: ListenerConfig) -> None:
 def parse_args() -> ListenerConfig:
     parser = argparse.ArgumentParser(description="Run local receivers for Variational CDP forwarder events.")
     parser.add_argument("--host", default="127.0.0.1", help="Host interface to bind receivers.")
-    parser.add_argument("--ws-port", type=int, default=8766, help="Port for WebSocket frame events.")
-    parser.add_argument("--rest-port", type=int, default=8767, help="Port for REST response events.")
-    parser.add_argument("--command-port", type=int, default=8768, help="Port for PLACE_ORDER command broker.")
+    parser.add_argument("--ws-port", type=int, default=8866, help="Port for WebSocket frame events.")
+    parser.add_argument("--rest-port", type=int, default=8867, help="Port for REST response events.")
+    parser.add_argument("--command-port", type=int, default=8868, help="Port for PLACE_ORDER command broker.")
     parser.add_argument(
         "--output-dir",
         type=Path,

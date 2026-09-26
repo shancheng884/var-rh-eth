@@ -5,7 +5,7 @@ Use only these two daily commands on the VPS.
 ## Start Live
 
 ```bash
-cd ~/Repository-name-variational-v1
+cd ~/var-rh-eth
 source .venv/bin/activate
 python tools/live.py --asset SOL
 ```
@@ -43,7 +43,7 @@ command exits and all other log writers are stopped.
 ## Analyze Live Data
 
 ```bash
-cd ~/Repository-name-variational-v1
+cd ~/var-rh-eth
 source .venv/bin/activate
 python tools/analyze.py
 ```
@@ -137,10 +137,10 @@ catches up missed days after a VPS outage. It reads only the small ledger and
 continues working when the strategy process is stopped:
 
 ```bash
-sudo cp deploy/systemd/var-lighter-daily-pnl.{service,timer} /etc/systemd/system/
+sudo cp deploy/systemd/var-rh-daily-pnl.{service,timer} /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now var-lighter-daily-pnl.timer
-systemctl list-timers var-lighter-daily-pnl.timer
+sudo systemctl enable --now var-rh-daily-pnl.timer
+systemctl list-timers var-rh-daily-pnl.timer
 ```
 
 Start a new persistent PnL reporting period, excluding all older trades:
@@ -314,7 +314,7 @@ while the strategy is stopped and both venues are confirmed flat. Close every
 Chrome window, open a terminal inside the VPS remote desktop, and run:
 
 ```bash
-cd ~/Repository-name-variational-v1
+cd ~/var-rh-eth
 source .venv/bin/activate
 python tools/launch_variational_chrome.py
 ```

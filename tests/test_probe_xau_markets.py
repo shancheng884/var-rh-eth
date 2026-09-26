@@ -64,7 +64,7 @@ def test_passive_evidence_reads_only_prices_events(tmp_path: Path) -> None:
 
 def _probe_args(tmp_path: Path, *, allow_rfq: bool) -> argparse.Namespace:
     return argparse.Namespace(
-        command_url="ws://127.0.0.1:8768",
+        command_url="ws://127.0.0.1:8868",
         qty="0.004",
         allow_rfq=allow_rfq,
         timeout_seconds=1.0,

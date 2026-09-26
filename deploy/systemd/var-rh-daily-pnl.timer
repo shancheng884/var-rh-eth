@@ -1,5 +1,5 @@
 [Unit]
-Description=Retry Var/Lighter daily PnL report until delivered
+Description=Retry Robinhood Chain daily PnL report until delivered
 
 [Timer]
 OnBootSec=2min

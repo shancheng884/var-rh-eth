@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 from bisect import bisect_left, bisect_right
+import os
 import subprocess
 import sys
 from collections import Counter, deque
@@ -53,7 +54,23 @@ def running_main_processes() -> list[str]:
         )
     except FileNotFoundError:
         return []
-    return [line for line in result.stdout.splitlines() if line.strip() and "tools/analyze.py" not in line]
+    return [
+        line
+        for line in result.stdout.splitlines()
+        if line.strip()
+        and "tools/analyze.py" not in line
+        and process_belongs_to_this_project(line)
+    ]
+
+
+def process_belongs_to_this_project(line: str) -> bool:
+    try:
+        process_id = int(line.split(maxsplit=1)[0])
+        process_cwd = Path(os.readlink(f"/proc/{process_id}/cwd")).resolve()
+        process_cwd.relative_to(ROOT.resolve())
+    except (IndexError, OSError, ValueError):
+        return False
+    return True
 
 
 def latest_run_filter(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:

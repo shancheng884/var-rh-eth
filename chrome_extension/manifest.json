@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "Variational CDP Forwarder",
+  "name": "Variational CDP Forwarder RH",
   "version": "1.1.2",
   "description": "Capture Variational REST responses and WebSocket frames via CDP and forward to local WebSocket ports.",
   "permissions": ["debugger", "tabs", "storage", "activeTab", "alarms"],

@@ -338,9 +338,9 @@ VARIATIONAL_TICKER_OVERRIDES = {
 VARIATIONAL_ASSET_TO_LIGHTER_TICKER = {v: k for k, v in VARIATIONAL_TICKER_OVERRIDES.items()}
 
 FORWARDER_HOST = "127.0.0.1"
-FORWARDER_WS_PORT = 8766
-FORWARDER_REST_PORT = 8767
-FORWARDER_COMMAND_PORT = 8768
+FORWARDER_WS_PORT = 8866
+FORWARDER_REST_PORT = 8867
+FORWARDER_COMMAND_PORT = 8868
 LOG_DIR = Path("./log")
 OUTPUT_DIR = LOG_DIR
 APP_LOG_FILE = LOG_DIR / "runtime.log"
@@ -389,7 +389,10 @@ DASHBOARD_REFRESH_SECONDS = 1.0
 DASHBOARD_ORDERS = 8
 SPREAD_HISTORY_SECONDS = 3600.0
 ASSET_SWITCH_CONFIRM_TICKS = 3
-LIGHTER_WS_URL = "wss://mainnet.zklighter.elliot.ai/stream"
+LIGHTER_API_URL = "https://api.rh.lighter.xyz"
+LIGHTER_WS_URL = "wss://api.rh.lighter.xyz/stream"
+LIGHTER_CHAIN_ID = 466324
+LIGHTER_INSTANCE = "robinhood"
 LIGHTER_WS_PING_INTERVAL_SECONDS = 30
 LIGHTER_WS_PING_TIMEOUT_SECONDS = 30
 HEALTH_VARIATIONAL_HEARTBEAT_DEGRADED_SECONDS = HEARTBEAT_STALE_SECONDS
@@ -2460,6 +2463,7 @@ class VariationalToLighterRuntime:
             if self.live_inventory_basis_reversion_mode
             else "legacy-basis"
         )
+        self.live_inventory_strategy_variant += "-robinhood-chain"
         if (
             self.live_inventory_basis_v4_mode
             and self.live_inventory_basis_v4_continuous
@@ -2483,6 +2487,7 @@ class VariationalToLighterRuntime:
             for key, value in vars(args).items()
             if key.startswith("live_inventory_") or key in {"mode", "live_allowed_assets"}
         }
+        strategy_config["lighter_instance"] = LIGHTER_INSTANCE
         self.live_inventory_config_hash = hashlib.sha256(
             json.dumps(strategy_config, ensure_ascii=True, sort_keys=True).encode("utf-8")
         ).hexdigest()[:16]
@@ -2779,7 +2784,7 @@ class VariationalToLighterRuntime:
         self.trade_event_cursor = 0
         self.trade_event_min_timestamp: datetime | None = None
 
-        self.lighter_base_url = "https://mainnet.zklighter.elliot.ai"
+        self.lighter_base_url = LIGHTER_API_URL
         self.account_index: int | None = None
         self.api_key_index: int | None = None
         self.lighter_client: Any | None = None
@@ -13074,6 +13079,10 @@ class VariationalToLighterRuntime:
                     warnings.append(f"disk_free_check_failed: {exc}")
 
         passed.append(f"mode={self.mode}")
+        passed.append(
+            f"lighter_instance={LIGHTER_INSTANCE} api={LIGHTER_API_URL} "
+            f"chain_id={LIGHTER_CHAIN_ID}"
+        )
         passed.append(f"forwarder_ws=ws://{forwarder_host}:{forwarder_ws_port}")
         passed.append(f"forwarder_rest=ws://{forwarder_host}:{forwarder_rest_port}")
         passed.append(f"forwarder_command=ws://{forwarder_host}:{forwarder_command_port}")
@@ -13381,6 +13390,7 @@ class VariationalToLighterRuntime:
                         url=self.lighter_base_url,
                         account_index=self.account_index,
                         api_private_keys={self.api_key_index: api_key_private_key},
+                        chain_id=LIGHTER_CHAIN_ID,
                     )
                     err = self.lighter_client.check_client()
                     if err is not None:

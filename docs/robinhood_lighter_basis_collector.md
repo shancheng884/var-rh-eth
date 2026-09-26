@@ -39,14 +39,14 @@ supported direct streaming connection before real orders are considered.
 Start the live process first. Then start the sidecar in a separate tmux session:
 
 ```bash
-cd ~/Repository-name-variational-v1
+cd ~/var-rh-eth
 source .venv/bin/activate
 
 SESSION="eth-rh-basis-$(date -u +%m%d%H%M)"
 OUT="log/${SESSION}.startup.log"
 
 tmux new-session -d -s "$SESSION" \
-"cd ~/Repository-name-variational-v1 && source .venv/bin/activate && exec python tools/robinhood_basis_collector.py >> '$OUT' 2>&1"
+"cd ~/var-rh-eth && source .venv/bin/activate && exec python tools/robinhood_basis_collector.py >> '$OUT' 2>&1"
 
 echo "session=$SESSION"
 echo "startup_log=$OUT"

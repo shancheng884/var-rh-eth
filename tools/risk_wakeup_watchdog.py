@@ -174,7 +174,14 @@ def process_is_strategy(pid: int | None) -> bool:
         )
     except OSError:
         return False
-    return "main.py" in command and "python" in command.lower()
+    if "main.py" not in command or "python" not in command.lower():
+        return False
+    try:
+        process_cwd = Path(os.readlink(f"/proc/{pid}/cwd")).resolve()
+        process_cwd.relative_to(ROOT.resolve())
+    except (OSError, ValueError):
+        return False
+    return True
 
 
 @contextlib.contextmanager

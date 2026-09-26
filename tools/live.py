@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -120,7 +121,13 @@ def running_main_processes() -> list[str]:
         )
     except FileNotFoundError:
         return []
-    return [line for line in result.stdout.splitlines() if line.strip() and "tools/live.py" not in line]
+    return [
+        line
+        for line in result.stdout.splitlines()
+        if line.strip()
+        and "tools/live.py" not in line
+        and process_belongs_to_this_project(line)
+    ]
 
 
 def running_live_strategy_processes() -> list[str]:
@@ -136,7 +143,9 @@ def running_live_strategy_processes() -> list[str]:
     return [
         line
         for line in result.stdout.splitlines()
-        if line.strip() and "tools/live.py" not in line
+        if line.strip()
+        and "tools/live.py" not in line
+        and process_belongs_to_this_project(line)
     ]
 
 
@@ -146,6 +155,18 @@ def process_id_from_line(line: str) -> int | None:
         return int(token)
     except ValueError:
         return None
+
+
+def process_belongs_to_this_project(line: str) -> bool:
+    process_id = process_id_from_line(line)
+    if process_id is None:
+        return False
+    try:
+        process_cwd = Path(os.readlink(f"/proc/{process_id}/cwd")).resolve()
+        process_cwd.relative_to(ROOT.resolve())
+    except (OSError, ValueError):
+        return False
+    return True
 
 
 def request_maintenance_drain(

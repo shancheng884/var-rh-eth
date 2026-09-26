@@ -1,15 +1,24 @@
-# variational-v1
+# var-rh-eth
+
+This is a separate Variational + Lighter on Robinhood Chain deployment. It does not change or share runtime state with the Lighter mainnet project.
+
+- Lighter API: `https://api.rh.lighter.xyz`
+- Lighter WebSocket: `wss://api.rh.lighter.xyz/stream`
+- Signing chain ID: `466324`
+- Variational forwarder ports: `8866` (WS), `8867` (REST), `8868` (commands)
+
+Use a separate project directory, `.env`, Variational browser profile, and Robinhood Chain Lighter account. Do not copy the mainnet `.env` or `log/` state into this project. The existing strategy thresholds were not calibrated against Robinhood Chain execution; verify market metadata, account positions, and fills with a small controlled run before increasing size. This code change does not start the strategy or submit orders.
 
 邀请链接：
 - Variational: [https://omni.variational.io/?ref=OMNIQUANT](https://omni.variational.io/?ref=OMNIQUANT)（直升 Bronze，获得 12% 积分加成）
-- Lighter: [https://app.lighter.xyz/?referral=QUANTGUY](https://app.lighter.xyz/?referral=QUANTGUY)
+- Robinhood Chain Lighter: [https://robinhoodchain.lighter.xyz](https://robinhoodchain.lighter.xyz)
 
 English version is below.
 
 ## 中文
 
 ### 概述
-`variational-v1` 是一个基于 Chrome 插件转发的运行时工具，用于：
+`var-rh-eth` 是一个基于 Chrome 插件转发的运行时工具，用于：
 1. 跟踪 Variational 订单生命周期，
 2. 在终端展示实时看板，
 3. 可选地在 Lighter 自动对冲。
@@ -66,7 +75,7 @@ LIGHTER_WS_SERVER_PINGS=true
 1. 打开 `chrome://extensions`
 2. 在右上角开启 `Developer mode`
 3. 在左上角点击 `Load unpacked`，选择：
-`variational-v1/chrome_extension`
+`var-rh-eth/chrome_extension`
 
 ### 运行
 ```bash
@@ -179,10 +188,10 @@ python main.py --lang en
 
 Referral Links:
 - Variational: [https://omni.variational.io/?ref=OMNIQUANT](https://omni.variational.io/?ref=OMNIQUANT) (instant Bronze tier + 12% points bonus)
-- Lighter: [https://app.lighter.xyz/?referral=QUANTGUY](https://app.lighter.xyz/?referral=QUANTGUY)
+- Robinhood Chain Lighter: [https://robinhoodchain.lighter.xyz](https://robinhoodchain.lighter.xyz)
 
 ### Overview
-`variational-v1` is a Chrome-extension-assisted runtime for:
+`var-rh-eth` is a Chrome-extension-assisted runtime for:
 1. tracking Variational order lifecycle,
 2. showing a terminal dashboard,
 3. optionally auto-hedging on Lighter.
@@ -239,7 +248,7 @@ When unset, the runtime uses the forward-compatible path: it keeps the socket al
 1. Open `chrome://extensions`
 2. Enable `Developer mode` (top-right)
 3. Click `Load unpacked` (top-left), then choose:
-`variational-v1/chrome_extension`
+`var-rh-eth/chrome_extension`
 
 ### Run
 ```bash

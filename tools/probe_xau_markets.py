@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_COMMAND_URL = "ws://127.0.0.1:8768"
+DEFAULT_COMMAND_URL = "ws://127.0.0.1:8868"
 DEFAULT_OUTPUT = ROOT / "log" / "xau_market_probe.json"
 INSTRUMENTS = (
     {

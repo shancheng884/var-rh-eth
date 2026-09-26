@@ -34,8 +34,8 @@ from variational.listener import CommandBroker, EventSink, run_command_server, r
 
 
 ALLOWED_ASSETS = {"BTC", "ETH", "SOL"}
-LIGHTER_REST_URL = "https://mainnet.zklighter.elliot.ai/api/v1/orderBooks"
-LIGHTER_WS_URL = "wss://mainnet.zklighter.elliot.ai/stream"
+LIGHTER_REST_URL = "https://api.rh.lighter.xyz/api/v1/orderBooks"
+LIGHTER_WS_URL = "wss://api.rh.lighter.xyz/stream"
 STABLECOIN_URL = "https://api.binance.com/api/v3/ticker/price?symbol=USDCUSDT"
 
 
@@ -728,9 +728,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--assets", required=True, help="Comma-separated BTC,ETH,SOL subset.")
     parser.add_argument("--output-dir", default=str(ROOT / "log"))
     parser.add_argument("--forwarder-host", default="127.0.0.1")
-    parser.add_argument("--forwarder-ws-port", type=int, default=8766)
-    parser.add_argument("--forwarder-rest-port", type=int, default=8767)
-    parser.add_argument("--forwarder-command-port", type=int, default=8768)
+    parser.add_argument("--forwarder-ws-port", type=int, default=8866)
+    parser.add_argument("--forwarder-rest-port", type=int, default=8867)
+    parser.add_argument("--forwarder-command-port", type=int, default=8868)
     parser.add_argument("--quote-notional-usd", type=float, default=20.0)
     parser.add_argument("--global-poll-interval-seconds", type=float, default=1.0)
     parser.add_argument("--baseline-interval-seconds", type=float, default=10.0)

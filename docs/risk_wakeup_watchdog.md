@@ -98,7 +98,7 @@ chmod 600 .env
 以下命令只补充看门狗的非敏感参数，不修改 Bark、飞书或交易凭证：
 
 ```bash
-cd ~/Repository-name-variational-v1
+cd ~/var-rh-eth
 source .venv/bin/activate
 python tools/setup_risk_wakeup.py
 set -a
@@ -161,11 +161,11 @@ feishu_phone_test=PASS
 ## 安装独立服务
 
 ```bash
-cd ~/Repository-name-variational-v1
-sudo cp deploy/risk-wakeup-watchdog.service /etc/systemd/system/risk-wakeup-watchdog.service
+cd ~/var-rh-eth
+sudo cp deploy/risk-wakeup-watchdog-rh.service /etc/systemd/system/risk-wakeup-watchdog-rh.service
 sudo systemctl daemon-reload
-sudo systemctl enable --now risk-wakeup-watchdog.service
-sudo systemctl status risk-wakeup-watchdog.service --no-pager
+sudo systemctl enable --now risk-wakeup-watchdog-rh.service
+sudo systemctl status risk-wakeup-watchdog-rh.service --no-pager
 cat log/risk_wakeup_watchdog_health.json
 ```
 
@@ -187,7 +187,7 @@ API、Variational 浏览器、Lighter 私钥或任何下单配置。
 在 B 端只安装代码和通知配置，不复制 A 的完整 `.env`：
 
 ```bash
-cd ~/Repository-name-variational-v1
+cd ~/var-rh-eth
 source .venv/bin/activate
 
 cat >> .env <<'EOF'
@@ -220,11 +220,11 @@ python tools/risk_wakeup_backup.py --silence-alerts --silence-minutes 120
 安装 B 端服务：
 
 ```bash
-sudo cp deploy/systemd/risk-wakeup-backup.service \
-  /etc/systemd/system/risk-wakeup-backup.service
+sudo cp deploy/systemd/risk-wakeup-backup-rh.service \
+  /etc/systemd/system/risk-wakeup-backup-rh.service
 sudo systemctl daemon-reload
-sudo systemctl enable --now risk-wakeup-backup.service
-sudo systemctl status risk-wakeup-backup.service --no-pager
+sudo systemctl enable --now risk-wakeup-backup-rh.service
+sudo systemctl status risk-wakeup-backup-rh.service --no-pager
 ```
 
 放行端口时只允许 A 访问，例如：
@@ -249,7 +249,7 @@ RISK_WAKEUP_BACKUP_TIMEOUT_SECONDS=4
 重启 A 端看门狗即可，不要重启交易策略：
 
 ```bash
-sudo systemctl restart risk-wakeup-watchdog.service
+sudo systemctl restart risk-wakeup-watchdog-rh.service
 python tools/risk_wakeup_watchdog.py --check
 ```
 

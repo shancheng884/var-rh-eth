@@ -441,14 +441,22 @@ def build_repaired_state(
 def _strategy_running() -> bool:
     try:
         result = subprocess.run(
-            ["pgrep", "-f", r"^/home/ubuntu/Repository-name-variational-v1/.venv/bin/python main.py "],
+            ["pgrep", "-af", r"python.*main\.py"],
             check=False,
             capture_output=True,
             text=True,
         )
     except FileNotFoundError:
         return False
-    return bool(result.stdout.strip())
+    for line in result.stdout.splitlines():
+        try:
+            process_id = int(line.split(maxsplit=1)[0])
+            process_cwd = Path(os.readlink(f"/proc/{process_id}/cwd")).resolve()
+            process_cwd.relative_to(ROOT.resolve())
+        except (IndexError, OSError, ValueError):
+            continue
+        return True
+    return False
 
 
 def main() -> int:

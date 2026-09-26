@@ -1,0 +1,14 @@
+[Unit]
+Description=Var/Robinhood Chain daily PnL Telegram report
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/var-rh-eth
+EnvironmentFile=-/home/ubuntu/var-rh-eth/.env
+ExecStart=/home/ubuntu/var-rh-eth/.venv/bin/python tools/daily_pnl_report.py --asset ETH
+
+[Install]
+WantedBy=multi-user.target
