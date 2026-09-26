@@ -623,12 +623,23 @@ class RobinhoodBasisCollector:
             "source_logged_at": source.get("logged_at"),
             "source_sample_index": source.get("sample_index"),
             "source_age_seconds": f"{source_age:.6f}",
+            "source_quote_source": source.get("quote_source"),
+            "source_quote_received_at": source.get("quote_received_at"),
+            "source_reference_price": source.get("reference_price"),
+            "source_sample_quality_version": source.get(
+                "sample_quality_version"
+            ),
+            "source_sample_pair_valid": source.get("sample_pair_valid"),
+            "source_quote_size_mode": source.get("quote_size_mode"),
             "source_var_quote_age_seconds": source.get("var_quote_age_seconds"),
             "var_bid": decimal_text(var_bid),
             "var_ask": decimal_text(var_ask),
             "normalized_var_bid": normalized_var_bid,
             "normalized_var_ask": normalized_var_ask,
             "robinhood_lighter_market_id": self.books.by_asset[self.asset].market_id,
+            "robinhood_lighter_primary_notional_usd": decimal_text(
+                self.primary_notional
+            ),
             "robinhood_lighter_bid": decimal_text(lighter_bid),
             "robinhood_lighter_ask": decimal_text(lighter_ask),
             "robinhood_lighter_buy_price": decimal_text(lighter_buy),

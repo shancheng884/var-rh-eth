@@ -756,6 +756,15 @@ def build_v4_live_funnel(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
             "v4_anchor_projected_ready_at"
         ),
         "anchor_ready": anchor_context.get("v4_anchor_ready"),
+        "robinhood_anchor_source_rows": latest_state.get(
+            "v4_robinhood_anchor_source_rows"
+        ),
+        "robinhood_anchor_accepted_rows": latest_state.get(
+            "v4_robinhood_anchor_accepted_rows"
+        ),
+        "robinhood_anchor_rejected_rows": latest_state.get(
+            "v4_robinhood_anchor_rejected_rows"
+        ),
         "health_ready": anchor_context.get("v4_health_ready"),
         "health_ready_observed": anchor_context.get(
             "v4_health_ready_observed"
@@ -824,6 +833,11 @@ def print_v4_live_funnel(rows: list[dict[str, Any]]) -> None:
         f"health_coverage_seconds={funnel['health_coverage_seconds']} "
         f"health_max_gap_seconds={funnel['health_max_gap_seconds']} "
         f"status={funnel['status']}"
+    )
+    print(
+        f"robinhood_anchor_source_rows={funnel['robinhood_anchor_source_rows']} "
+        f"accepted={funnel['robinhood_anchor_accepted_rows']} "
+        f"rejected={funnel['robinhood_anchor_rejected_rows']}"
     )
     if funnel["bidirectional"]:
         print(

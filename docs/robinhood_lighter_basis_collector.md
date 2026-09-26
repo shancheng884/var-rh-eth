@@ -1,7 +1,8 @@
 # Robinhood Chain Lighter basis sidecar
 
 This sidecar measures executable ETH basis between Variational and the Lighter
-deployment on Robinhood Chain. It is research-only:
+deployment on Robinhood Chain. It never submits trades or modifies inventory;
+validated baseline history can be consumed read-only by the V4 anchor:
 
 - It tails Variational quotes already written by the live V4 process under
   `log/basis_samples/ETH/`.
@@ -23,8 +24,17 @@ book ages, nonce continuity, and depth prices.
 Trade-event snapshots preserve the source event, run, episode, lot, direction,
 and available Variational price/PnL fields. Cross-venue edge fields remain null
 when an event does not contain enough Variational price data; the collector does
-not substitute a later quote. Baseline and event snapshots are research data
-only and never feed the live entry or exit path.
+not substitute a later quote. Event snapshots remain research-only. Validated
+baseline snapshots may contribute only to the V4 rolling entry anchor; they do
+not replace live quotes, satisfy the recent-health window, or change execution
+sizing. V4 checks market ID, lot notional, source quote age, and Robinhood book
+freshness/continuity before accepting them.
+
+The default source is `log/robinhood_basis_samples/`. An existing sidecar
+history elsewhere can be included by setting
+`LIVE_INVENTORY_BASIS_V4_ROBINHOOD_HISTORY_DIR` for the live process. Point it
+only at a Robinhood sidecar sample root, never the old mainnet
+`basis_samples` directory.
 
 The official browser WebSocket currently rejects an unauthenticated bare
 Python handshake at its WAF boundary. The sidecar therefore requests one full

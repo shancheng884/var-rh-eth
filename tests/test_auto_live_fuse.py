@@ -1205,6 +1205,71 @@ def test_v4_history_filter_rejects_stale_and_duplicate_passive_pairs() -> None:
     assert counts["rejected"] == 3
 
 
+def test_v4_history_filter_accepts_only_fresh_matching_robinhood_baselines() -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    runtime.live_inventory_max_lighter_book_age_seconds = 2.0
+    runtime.live_inventory_basis_max_var_quote_age_ms = 1500
+    runtime.live_inventory_lot_notional_usd = Decimal("20")
+    runtime.lighter_market_index = 0
+    base = {
+        "event": "robinhood_lighter_basis_state",
+        "sample_id": "rh-1",
+        "asset": "ETH",
+        "logged_at": "2026-09-20T00:00:00+00:00",
+        "sample_kind": "baseline",
+        "sample_quality": "valid",
+        "venue": "robinhood_chain_lighter",
+        "execution_mode": "collect_only",
+        "basis_collect_only": True,
+        "source_age_seconds": "0.2",
+        "source_var_quote_age_seconds": "0.1",
+        "source_sample_quality_version": 2,
+        "source_sample_pair_valid": True,
+        "source_quote_source": "websocket",
+        "robinhood_lighter_book_age_seconds": "0.1",
+        "robinhood_lighter_continuity_ok": True,
+        "robinhood_lighter_sequence_gaps": 0,
+        "robinhood_lighter_market_id": 0,
+        "robinhood_lighter_primary_notional_usd": "20",
+        "depth_ladder": [{"notional_usd": "20"}],
+        "short_edge_bps": "8",
+        "long_edge_bps": "-8",
+    }
+    legacy = {
+        key: value
+        for key, value in base.items()
+        if key
+        not in {
+            "source_quote_source",
+            "source_quote_received_at",
+            "source_reference_price",
+            "source_sample_quality_version",
+            "source_sample_pair_valid",
+            "source_quote_size_mode",
+            "robinhood_lighter_primary_notional_usd",
+        }
+    }
+    legacy["sample_id"] = "rh-legacy"
+
+    accepted, counts = runtime.filter_live_inventory_basis_v4_history_rows(
+        [
+            base,
+            legacy,
+            {**base, "sample_id": "rh-stale", "source_age_seconds": "91"},
+            {**base, "sample_id": "rh-wrong-market", "robinhood_lighter_market_id": 1},
+            {**base, "sample_id": "rh-wrong-size", "robinhood_lighter_primary_notional_usd": "40"},
+            {**base, "sample_id": "rh-gap", "robinhood_lighter_sequence_gaps": 1},
+        ]
+    )
+
+    assert accepted == [base, legacy]
+    assert counts["robinhood_var_source_stale"] == 1
+    assert counts["robinhood_market_mismatch"] == 1
+    assert counts["robinhood_depth_notional_mismatch"] == 1
+    assert counts["robinhood_book_continuity_invalid"] == 1
+    assert counts["rejected"] == 4
+
+
 def test_manual_review_sets_runtime_level_auto_live_fuse() -> None:
     runtime = _runtime_for_fuse_test()
     position = _position()
@@ -2727,6 +2792,80 @@ def test_v4_history_loader_requires_7d_anchor_and_recent_health(tmp_path) -> Non
     assert context["compatible_source_rows"] == 5760
     assert context["incompatible_quote_size_rows"] == 0
     assert context["quote_size_mode"] == "exact_base_qty_v1"
+
+
+def test_v4_history_loader_uses_external_robinhood_anchor_but_not_health(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    runtime.output_dir = tmp_path / "live_project"
+    runtime.live_inventory_basis_v4_profile = (
+        "eth_short_execution_calibrated_20260724_n10"
+    )
+    runtime.live_inventory_basis_v4_bidirectional = False
+    runtime.live_inventory_basis_v4_history = deque()
+    runtime.live_inventory_basis_v4_next_history_sample_at = 0.0
+    runtime.live_inventory_basis_v4_history_ready = False
+    runtime.live_inventory_basis_v4_history_reason = "not_loaded"
+    runtime.live_inventory_max_lighter_book_age_seconds = 2.0
+    runtime.live_inventory_basis_max_var_quote_age_ms = 1500
+    runtime.live_inventory_lot_notional_usd = Decimal("20")
+    runtime.lighter_market_index = 0
+    external_root = tmp_path / "old_robinhood_collector" / "robinhood_basis_samples"
+    monkeypatch.setenv(
+        "LIVE_INVENTORY_BASIS_V4_ROBINHOOD_HISTORY_DIR",
+        str(external_root),
+    )
+    asset_dir = external_root / "ETH"
+    asset_dir.mkdir(parents=True)
+    now = datetime.now(timezone.utc).timestamp()
+    rows = []
+    for index in range(5760):
+        timestamp = now - 172_770 + index * 30
+        rows.append(
+            {
+                "event": "robinhood_lighter_basis_state",
+                "sample_id": f"rh-{index}",
+                "asset": "ETH",
+                "logged_at": datetime.fromtimestamp(
+                    timestamp, tz=timezone.utc
+                ).isoformat(),
+                "sample_kind": "baseline",
+                "sample_quality": "valid",
+                "venue": "robinhood_chain_lighter",
+                "execution_mode": "collect_only",
+                "basis_collect_only": True,
+                "source_age_seconds": "0.2",
+                "source_var_quote_age_seconds": "0.1",
+                "source_sample_quality_version": 2,
+                "source_sample_pair_valid": True,
+                "source_quote_source": "websocket",
+                "robinhood_lighter_book_age_seconds": "0.1",
+                "robinhood_lighter_continuity_ok": True,
+                "robinhood_lighter_sequence_gaps": 0,
+                "robinhood_lighter_market_id": 0,
+                "robinhood_lighter_primary_notional_usd": "20",
+                "depth_ladder": [{"notional_usd": "20"}],
+                "short_edge_bps": str(index % 100),
+                "long_edge_bps": str(-(index % 100)),
+            }
+        )
+    (asset_dir / "2026-09-25.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    context = runtime.load_live_inventory_basis_v4_history(asset="ETH")
+
+    assert context["robinhood_anchor_source_rows"] == 5760
+    assert context["robinhood_anchor_accepted_rows"] == 5760
+    assert context["robinhood_anchor_rejected_rows"] == 0
+    assert context["v4_anchor_ready"] is True
+    assert context["v4_health_ready_observed"] is False
+    assert context["v4_health_ready"] is False
+    assert context["ready"] is False
+    assert context["reason"] == "recent_1h_health_not_ready"
 
 
 def test_v4_history_loader_joins_samples_across_long_gap(tmp_path) -> None:

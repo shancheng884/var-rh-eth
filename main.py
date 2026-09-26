@@ -102,6 +102,7 @@ LIVE_INVENTORY_BASIS_V4_PROFILE_CHOICES = (
     LIVE_INVENTORY_BASIS_V4_PROFILE_ETH_SHORT_20260724,
 )
 LIVE_INVENTORY_BASIS_V4_ANCHOR_WINDOW_SECONDS = 604800
+LIVE_INVENTORY_BASIS_V4_ROBINHOOD_SOURCE_MAX_AGE_SECONDS = 90.0
 LIVE_INVENTORY_BASIS_V4_FAST_WINDOW_SECONDS = 86400
 LIVE_INVENTORY_BASIS_V4_MID_WINDOW_SECONDS = 15 * 86400
 LIVE_INVENTORY_BASIS_V4_LONG_WINDOW_SECONDS = 30 * 86400
@@ -2693,6 +2694,9 @@ class VariationalToLighterRuntime:
         self.live_inventory_basis_v4_next_history_sample_at = 0.0
         self.live_inventory_basis_v4_history_ready = False
         self.live_inventory_basis_v4_history_reason = "not_loaded"
+        self.live_inventory_basis_v4_robinhood_anchor_source_rows = 0
+        self.live_inventory_basis_v4_robinhood_anchor_accepted_rows = 0
+        self.live_inventory_basis_v4_robinhood_anchor_rejected_rows = 0
         self.live_inventory_basis_v4_projection_cached_at = 0.0
         self.live_inventory_basis_v4_projection_cache: dict[str, Any] = {}
         self.live_inventory_basis_v4_threshold_cached_at = 0.0
@@ -8906,6 +8910,7 @@ class VariationalToLighterRuntime:
         accepted: list[dict[str, Any]] = []
         counts: dict[str, int] = {}
         seen_passive_keys: set[str] = set()
+        seen_robinhood_sample_ids: set[str] = set()
         lighter_age_limit = float(
             getattr(self, "live_inventory_max_lighter_book_age_seconds", 2.0)
             or 2.0
@@ -8922,6 +8927,139 @@ class VariationalToLighterRuntime:
             rows,
             key=lambda item: str(item.get("logged_at") or ""),
         ):
+            if row.get("venue") == "robinhood_chain_lighter":
+                if (
+                    row.get("event") != "robinhood_lighter_basis_state"
+                    or row.get("sample_kind") != "baseline"
+                    or row.get("sample_quality") != "valid"
+                    or row.get("execution_mode") != "collect_only"
+                    or row.get("basis_collect_only") is not True
+                ):
+                    reject("robinhood_not_valid_baseline")
+                    continue
+                sample_id = str(row.get("sample_id") or "")
+                if not sample_id or sample_id in seen_robinhood_sample_ids:
+                    reject("robinhood_sample_id_missing_or_duplicate")
+                    continue
+                seen_robinhood_sample_ids.add(sample_id)
+
+                source_age = to_decimal(row.get("source_age_seconds"))
+                if (
+                    source_age is None
+                    or source_age < Decimal("-1")
+                    or source_age
+                    > Decimal(str(LIVE_INVENTORY_BASIS_V4_ROBINHOOD_SOURCE_MAX_AGE_SECONDS))
+                ):
+                    reject("robinhood_var_source_stale")
+                    continue
+                var_age = to_decimal(row.get("source_var_quote_age_seconds"))
+                source_quote = str(row.get("source_quote_source") or "")
+                var_age_limit = (
+                    LIVE_INVENTORY_BASIS_PASSIVE_REFERENCE_MAX_AGE_SECONDS
+                    if source_quote == LIVE_INVENTORY_BASIS_PASSIVE_QUOTE_SOURCE
+                    else exact_age_limit
+                )
+                if var_age is None or var_age < 0 or var_age > Decimal(str(var_age_limit)):
+                    reject("robinhood_var_quote_too_old")
+                    continue
+                source_quality_version = int(
+                    to_decimal(row.get("source_sample_quality_version")) or 0
+                )
+                if (
+                    source_quality_version
+                    >= LIVE_INVENTORY_BASIS_SAMPLE_QUALITY_VERSION
+                    and row.get("source_sample_pair_valid") is not True
+                ):
+                    reject("robinhood_invalid_source_pair")
+                    continue
+
+                lighter_age = to_decimal(
+                    row.get("robinhood_lighter_book_age_seconds")
+                )
+                if (
+                    lighter_age is None
+                    or lighter_age < 0
+                    or (
+                        lighter_age_limit > 0
+                        and lighter_age > Decimal(str(lighter_age_limit))
+                    )
+                ):
+                    reject("robinhood_book_stale")
+                    continue
+                sequence_gaps = to_decimal(
+                    row.get("robinhood_lighter_sequence_gaps")
+                )
+                if (
+                    row.get("robinhood_lighter_continuity_ok") is not True
+                    or sequence_gaps != 0
+                ):
+                    reject("robinhood_book_continuity_invalid")
+                    continue
+
+                row_market_id = to_decimal(
+                    row.get("robinhood_lighter_market_id")
+                )
+                current_market_id = to_decimal(
+                    getattr(self, "lighter_market_index", None)
+                )
+                if (
+                    row_market_id is None
+                    or (
+                        current_market_id is not None
+                        and row_market_id != current_market_id
+                    )
+                ):
+                    reject("robinhood_market_mismatch")
+                    continue
+
+                lot_notional = to_decimal(
+                    getattr(self, "live_inventory_lot_notional_usd", None)
+                )
+                depth_ladder = row.get("depth_ladder")
+                primary_notional = to_decimal(
+                    row.get("robinhood_lighter_primary_notional_usd")
+                )
+                if primary_notional is None and isinstance(depth_ladder, list):
+                    primary_notional = next(
+                        (
+                            to_decimal(item.get("notional_usd"))
+                            for item in depth_ladder
+                            if isinstance(item, dict)
+                        ),
+                        None,
+                    )
+                if (
+                    lot_notional is None
+                    or primary_notional is None
+                    or primary_notional != lot_notional
+                ):
+                    reject("robinhood_depth_notional_mismatch")
+                    continue
+                if (
+                    to_decimal(row.get("long_edge_bps")) is None
+                    or to_decimal(row.get("short_edge_bps")) is None
+                ):
+                    reject("robinhood_edge_missing")
+                    continue
+
+                if source_quote == LIVE_INVENTORY_BASIS_PASSIVE_QUOTE_SOURCE:
+                    identity = row.get("source_quote_received_at")
+                    reference_price = row.get("source_reference_price") or row.get(
+                        "var_bid"
+                    )
+                    if identity in (None, "") or reference_price in (None, ""):
+                        reject("robinhood_passive_reference_identity_missing")
+                        continue
+                    passive_key = ":".join(
+                        (str(identity), str(reference_price))
+                    )
+                    if passive_key in seen_passive_keys:
+                        reject("duplicate_passive_reference")
+                        continue
+                    seen_passive_keys.add(passive_key)
+                accepted.append(row)
+                continue
+
             quality_version = int(to_decimal(row.get("sample_quality_version")) or 0)
             if (
                 quality_version >= LIVE_INVENTORY_BASIS_SAMPLE_QUALITY_VERSION
@@ -9077,8 +9215,57 @@ class VariationalToLighterRuntime:
             sample_kind_filter="baseline",
             sample_quality_filter="valid",
         )
+        robinhood_roots = [
+            (self.output_dir / "robinhood_basis_samples").resolve()
+        ]
+        configured_robinhood_root = os.getenv(
+            "LIVE_INVENTORY_BASIS_V4_ROBINHOOD_HISTORY_DIR", ""
+        ).strip()
+        if configured_robinhood_root:
+            external_root = Path(configured_robinhood_root).expanduser().resolve()
+            if external_root not in robinhood_roots:
+                robinhood_roots.append(external_root)
+        robinhood_rows_by_id: dict[str, dict[str, Any]] = {}
+        robinhood_rows_without_id: list[dict[str, Any]] = []
+        for root in robinhood_roots:
+            for row in read_basis_samples(
+                root,
+                limit=100000,
+                asset_filter=asset,
+                sample_kind_filter="baseline",
+                sample_quality_filter="valid",
+            ):
+                if row.get("venue") != "robinhood_chain_lighter":
+                    continue
+                sample_id = str(row.get("sample_id") or "")
+                if sample_id:
+                    robinhood_rows_by_id.setdefault(sample_id, row)
+                else:
+                    robinhood_rows_without_id.append(row)
+        robinhood_source_rows = [
+            *robinhood_rows_by_id.values(),
+            *robinhood_rows_without_id,
+        ]
+        raw_source_rows.extend(robinhood_source_rows)
         source_rows, sample_quality_counts = (
             self.filter_live_inventory_basis_v4_history_rows(raw_source_rows)
+        )
+        robinhood_accepted_rows = sum(
+            row.get("venue") == "robinhood_chain_lighter"
+            for row in source_rows
+        )
+        robinhood_rejected_rows = max(
+            0,
+            len(robinhood_source_rows) - robinhood_accepted_rows,
+        )
+        self.live_inventory_basis_v4_robinhood_anchor_source_rows = len(
+            robinhood_source_rows
+        )
+        self.live_inventory_basis_v4_robinhood_anchor_accepted_rows = (
+            robinhood_accepted_rows
+        )
+        self.live_inventory_basis_v4_robinhood_anchor_rejected_rows = (
+            robinhood_rejected_rows
         )
         quote_size_mode = str(
             getattr(
@@ -9302,6 +9489,9 @@ class VariationalToLighterRuntime:
             direction_contexts[direction] = {
                 "entry_edge_key": edge_key,
                 "history_samples": len(history),
+                "robinhood_anchor_source_rows": len(robinhood_source_rows),
+                "robinhood_anchor_accepted_rows": robinhood_accepted_rows,
+                "robinhood_anchor_rejected_rows": robinhood_rejected_rows,
                 "quote_size_mode": quote_size_mode,
                 "compatible_source_rows": len(compatible_source_rows),
                 "incompatible_quote_size_rows": incompatible_quote_size_rows,
@@ -9338,6 +9528,9 @@ class VariationalToLighterRuntime:
             "asset": asset,
             "raw_source_rows": len(raw_source_rows),
             "source_rows": len(source_rows),
+            "robinhood_anchor_source_rows": len(robinhood_source_rows),
+            "robinhood_anchor_accepted_rows": robinhood_accepted_rows,
+            "robinhood_anchor_rejected_rows": robinhood_rejected_rows,
             "sample_quality_counts": sample_quality_counts,
             "compatible_source_rows": len(compatible_source_rows),
             "incompatible_quote_size_rows": incompatible_quote_size_rows,
@@ -18521,13 +18714,28 @@ class VariationalToLighterRuntime:
         v4_rearm_context: dict[str, Any] = {}
         v4_baseline_sample_due = False
         if v4_mode:
-            # The Robinhood-chain collector is a separate research process.
-            # Live trading never reads its files or waits for its health path.
+            # Robinhood sidecar history is anchor-only; current quotes and
+            # the recent-health gate still come from the live runtime.
             robinhood_context = {
-                "v4_robinhood_status": "independent_sidecar",
+                "v4_robinhood_status": "validated_history_anchor_only",
                 "v4_robinhood_fresh": None,
                 "v4_robinhood_threshold_penalty_bps": "0",
-                "v4_robinhood_policy": "independent_observation_only",
+                "v4_robinhood_policy": "validated_baseline_anchor_only",
+                "v4_robinhood_anchor_source_rows": getattr(
+                    self,
+                    "live_inventory_basis_v4_robinhood_anchor_source_rows",
+                    0,
+                ),
+                "v4_robinhood_anchor_accepted_rows": getattr(
+                    self,
+                    "live_inventory_basis_v4_robinhood_anchor_accepted_rows",
+                    0,
+                ),
+                "v4_robinhood_anchor_rejected_rows": getattr(
+                    self,
+                    "live_inventory_basis_v4_robinhood_anchor_rejected_rows",
+                    0,
+                ),
             }
             for direction in v4_entry_directions:
                 threshold, context = self.live_inventory_basis_v4_entry_threshold(

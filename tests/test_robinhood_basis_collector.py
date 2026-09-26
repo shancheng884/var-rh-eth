@@ -105,7 +105,9 @@ def test_collector_builds_depth_ladder_without_credentials(tmp_path) -> None:
         assert row is not None
         assert row["event"] == "robinhood_lighter_basis_state"
         assert row["robinhood_lighter_market_id"] == 0
+        assert row["robinhood_lighter_primary_notional_usd"] == "20"
         assert row["source_sample_id"] == "source-1"
+        assert row["source_quote_source"] is None
         assert row["private_credentials_loaded"] is False
         assert [item["notional_usd"] for item in row["depth_ladder"]] == [
             "20",
