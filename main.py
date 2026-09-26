@@ -5016,7 +5016,7 @@ class VariationalToLighterRuntime:
         from lighter import OrderApi
 
         result = await OrderApi(client.api_client).account_active_orders(
-            auth=auth_token,
+            authorization=auth_token,
             account_index=self.account_index,
             market_id=market_id,
             _request_timeout=10.0,

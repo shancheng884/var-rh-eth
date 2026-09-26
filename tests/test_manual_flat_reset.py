@@ -103,7 +103,7 @@ def test_lighter_active_order_request_includes_resolved_market_id(monkeypatch) -
     asyncio.run(run())
     assert captured["account_index"] == 12
     assert captured["market_id"] == 9
-    assert captured["auth"] == "read-token"
+    assert captured["authorization"] == "read-token"
 
 
 def test_state_only_reset_requires_verified_flat_and_creates_backup(tmp_path) -> None:
