@@ -568,6 +568,9 @@ def evaluate_incidents(
         data_visibility_risk = exposure and risk_reason in {
             "variational_account_snapshot_stale",
             "account_equity_unavailable",
+            "lighter_account_equity_unavailable",
+            "variational_account_equity_unavailable",
+            "both_accounts_equity_unavailable",
         }
         incidents.append(
             Incident(

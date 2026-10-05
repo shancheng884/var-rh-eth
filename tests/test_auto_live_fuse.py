@@ -172,6 +172,137 @@ def test_account_recovery_resets_after_an_incomplete_check() -> None:
     assert result["account_recovery_required"] is True
 
 
+def test_lighter_account_failure_reason_stays_stable_until_recovery() -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    runtime.live_inventory_account_recovery_required = False
+    runtime.live_inventory_account_recovery_confirm_count = 0
+    runtime.live_inventory_account_recovery_confirm_samples = 3
+    runtime.live_inventory_account_recovery_reason = None
+    runtime.live_inventory_basis_entry_confirm_counts = {}
+    runtime.live_inventory_v4_gradient_entry_tier_window = deque(maxlen=3)
+    unavailable = {
+        "risk_action": "block_entry",
+        "risk_reason": "account_equity_unavailable",
+        "variational_account_snapshot_fresh": True,
+        "variational_account_snapshot_usable": True,
+        "variational_equity_usd": "100",
+        "lighter_equity_usd": None,
+        "lighter_risk_fetch_error": "ServiceException:HTTP 502",
+    }
+
+    failed = runtime.apply_live_inventory_account_recovery_gate(unavailable)
+
+    assert failed["risk_reason"] == "lighter_account_equity_unavailable"
+    assert failed["account_recovery_reason"] == "lighter_account_equity_unavailable"
+
+    healthy = {
+        "risk_action": "normal",
+        "risk_reason": "account_risk_normal",
+        "variational_account_snapshot_fresh": True,
+        "variational_account_snapshot_usable": True,
+        "variational_equity_usd": "100",
+        "lighter_equity_usd": "100",
+    }
+    first = runtime.apply_live_inventory_account_recovery_gate(
+        healthy,
+        advance_confirmation=True,
+    )
+    second = runtime.apply_live_inventory_account_recovery_gate(
+        healthy,
+        advance_confirmation=True,
+    )
+    third = runtime.apply_live_inventory_account_recovery_gate(
+        healthy,
+        advance_confirmation=True,
+    )
+
+    assert first["risk_action"] == second["risk_action"] == "block_entry"
+    assert first["risk_reason"] == second["risk_reason"] == (
+        "lighter_account_equity_unavailable"
+    )
+    assert third["risk_action"] == "normal"
+    assert third["account_recovery_required"] is False
+
+
+def test_lighter_account_read_retries_transient_server_error_only(monkeypatch) -> None:
+    import asyncio
+    import sys
+
+    import main as main_module
+
+    async def run() -> None:
+        nonlocal_calls = {"count": 0}
+
+        class TransientServerError(Exception):
+            status_code = 502
+
+        class FakeAccountApi:
+            def __init__(self, _client):
+                pass
+
+            async def account(self, **_kwargs):
+                nonlocal_calls["count"] += 1
+                if nonlocal_calls["count"] == 1:
+                    raise TransientServerError("upstream unavailable")
+                return {"code": 0, "accounts": []}
+
+        monkeypatch.setitem(
+            sys.modules,
+            "lighter",
+            type("FakeLighterModule", (), {"AccountApi": FakeAccountApi}),
+        )
+        monkeypatch.setattr(
+            main_module,
+            "LIGHTER_ACCOUNT_READ_RETRY_DELAYS_SECONDS",
+            (0.0, 0.0),
+        )
+        runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+        runtime.account_index = 7
+        runtime.initialize_lighter_client = lambda: SimpleNamespace(api_client=object())
+
+        result = await runtime.fetch_lighter_account()
+
+        assert result == {"code": 0, "accounts": []}
+        assert nonlocal_calls["count"] == 2
+
+    asyncio.run(run())
+
+
+def test_lighter_account_read_does_not_retry_auth_error(monkeypatch) -> None:
+    import asyncio
+    import sys
+
+    async def run() -> None:
+        calls = {"count": 0}
+
+        class AuthenticationError(Exception):
+            status_code = 401
+
+        class FakeAccountApi:
+            def __init__(self, _client):
+                pass
+
+            async def account(self, **_kwargs):
+                calls["count"] += 1
+                raise AuthenticationError("unauthorized")
+
+        monkeypatch.setitem(
+            sys.modules,
+            "lighter",
+            type("FakeLighterModule", (), {"AccountApi": FakeAccountApi}),
+        )
+        runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+        runtime.account_index = 7
+        runtime.initialize_lighter_client = lambda: SimpleNamespace(api_client=object())
+
+        with pytest.raises(AuthenticationError):
+            await runtime.fetch_lighter_account()
+
+        assert calls["count"] == 1
+
+    asyncio.run(run())
+
+
 def test_startup_recovery_requires_strictly_fresh_snapshot() -> None:
     runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
     runtime.live_inventory_account_recovery_required = True
@@ -1900,6 +2031,86 @@ def test_live_inventory_startup_reconcile_accepts_matching_open_pair(tmp_path) -
         assert state["reason"] == "startup_open_state_reconciled"
 
     asyncio.run(run())
+
+
+def test_live_inventory_startup_reconcile_rejects_wrong_variational_direction(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_inventory_reconcile_on_start = True
+        runtime.live_allowed_assets = {"ETH"}
+        runtime.live_inventory_open_lots = [
+            {"lot_id": 1, "asset": "ETH", "direction": "short_var_long_lighter", "qty": "0.0814"}
+        ]
+
+        async def var_positions():
+            return {"ok": True, "result": {"positions": [{"instrument": {"underlying": "ETH"}, "qty": "0.0814"}]}}
+
+        async def lighter_account():
+            return {"accounts": [{"positions": [{"symbol": "ETH", "sign": 1, "position": "0.0814"}]}]}
+
+        runtime.fetch_variational_positions = var_positions
+        runtime.fetch_lighter_account = lighter_account
+        with pytest.raises(RuntimeError, match="do not match local open lots"):
+            await runtime.reconcile_live_inventory_startup_state()
+        state = json.loads(runtime.live_inventory_state_file.read_text(encoding="utf-8"))
+        assert state["manual_review_reason"] == "startup_reconcile_exchange_position_mismatch"
+        assert state["manual_review_context"]["expected_var_sign"] == "-1"
+
+    asyncio.run(run())
+
+
+def test_balanced_entry_manual_review_requires_no_orders_before_takeover(tmp_path) -> None:
+    async def run(*, active_orders: bool) -> tuple[bool, str]:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_inventory_reconcile_on_start = True
+        runtime.live_inventory_i_accept_open_state_resume = True
+        runtime.live_allowed_assets = {"ETH"}
+        runtime.live_inventory_open_lots = [
+            {"lot_id": i, "asset": "ETH", "direction": "short_var_long_lighter", "qty": "0.0074"}
+            for i in range(1, 12)
+        ]
+        runtime.live_inventory_state_file.write_text(
+            json.dumps({
+                "status": "manual_review_required",
+                "asset": "ETH",
+                "manual_review_reason": "basis_entry_lighter_submit_after_var_fill_failed",
+                "open_lots": runtime.live_inventory_open_lots,
+                "pending_actions": [],
+            }),
+            encoding="utf-8",
+        )
+
+        async def var_positions():
+            return {"ok": True, "result": {"positions": [{"instrument": {"underlying": "ETH"}, "qty": "-0.0814"}]}}
+
+        async def lighter_account():
+            return {"accounts": [{"positions": [{"symbol": "ETH", "sign": 1, "position": "0.0814"}]}]}
+
+        async def var_orders(*, asset):
+            assert asset == "ETH"
+            return [{"id": "pending"}] if active_orders else []
+
+        async def lighter_orders():
+            return []
+
+        async def no_snapshot(**kwargs):
+            return None
+
+        runtime.fetch_variational_positions = var_positions
+        runtime.fetch_lighter_account = lighter_account
+        runtime.fetch_all_variational_pending_orders = var_orders
+        runtime.fetch_lighter_active_orders = lighter_orders
+        runtime.capture_live_inventory_account_snapshot = no_snapshot
+        if active_orders:
+            with pytest.raises(RuntimeError, match="active orders remain"):
+                await runtime.reconcile_live_inventory_startup_state()
+        else:
+            await runtime.reconcile_live_inventory_startup_state()
+        state = json.loads(runtime.live_inventory_state_file.read_text(encoding="utf-8"))
+        return active_orders, state["status"]
+
+    assert asyncio.run(run(active_orders=True)) == (True, "manual_review_required")
+    assert asyncio.run(run(active_orders=False)) == (False, "open")
 
 
 def test_live_inventory_blocks_spread_reverted_exit_until_entry_cost_confirmed(tmp_path) -> None:

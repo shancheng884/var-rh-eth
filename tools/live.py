@@ -37,6 +37,7 @@ RECOVERABLE_OPEN_STATE_MANUAL_REASONS = frozenset(
         # A failed reduce-only hedge may leave the saved paired lots intact.
         # Startup must still reconcile both venue quantities and directions.
         "basis_exit_lighter_final_fill_not_confirmed",
+        "basis_entry_lighter_submit_after_var_fill_failed",
     }
 )
 CALIBRATION_DIRECTIONS = {
@@ -268,6 +269,10 @@ def validate_state(
         state_is_resumable = status in {"open", "pending"} or (
             status == "manual_review_required"
             and manual_reason in RECOVERABLE_OPEN_STATE_MANUAL_REASONS
+            and (
+                manual_reason != "basis_entry_lighter_submit_after_var_fill_failed"
+                or not pending_actions
+            )
         )
         if not state_is_resumable:
             return (

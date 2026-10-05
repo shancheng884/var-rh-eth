@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import os
+import re
 import shutil
 import signal
 import time
@@ -214,6 +215,7 @@ LIVE_INVENTORY_ENTRY_BLOCKED_LOG_THROTTLE_SECONDS = 30.0
 LIVE_INVENTORY_VARIATIONAL_ACCOUNT_MAX_AGE_SECONDS = 60.0
 LIVE_INVENTORY_VARIATIONAL_ACCOUNT_USABLE_MAX_AGE_SECONDS = 300.0
 LIVE_INVENTORY_ACCOUNT_RECOVERY_CONFIRM_SAMPLES = 3
+LIGHTER_ACCOUNT_READ_RETRY_DELAYS_SECONDS = (0.25, 0.75)
 LIVE_INVENTORY_ACCOUNT_RISK_NOTIFICATION_CONFIRM_SAMPLES = 2
 LIVE_INVENTORY_ACCOUNT_RISK_NOTIFICATION_RECOVERY_SAMPLES = 3
 LIVE_INVENTORY_ACCOUNT_RISK_IMBALANCE_CLEAR_BUFFER = Decimal("0.02")
@@ -235,6 +237,7 @@ LIVE_INVENTORY_OPEN_STATE_RESUME_MANUAL_REASONS = frozenset(
         "runtime_stopped_with_unresolved_entry_submission",
         # Only the strict startup reconciliation can clear this exit failure.
         "basis_exit_lighter_final_fill_not_confirmed",
+        "basis_entry_lighter_submit_after_var_fill_failed",
     }
 )
 LIVE_INVENTORY_BASIS_V4_REAL_GRADIENT_MAX_TIERS = 5
@@ -924,6 +927,53 @@ def account_risk_notification_transition(
         "notification_recovery_confirm_count": 0,
         "notification_event": event,
     }
+
+
+def is_retryable_lighter_account_read_error(exc: Exception) -> bool:
+    """Retry only transient transport failures and server-side errors."""
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError, OSError)):
+        return True
+
+    for attribute in ("status", "status_code", "http_status"):
+        value = getattr(exc, attribute, None)
+        if isinstance(value, (list, tuple)) and value:
+            value = value[0]
+        try:
+            status = int(value)
+        except (TypeError, ValueError):
+            continue
+        if 500 <= status <= 599:
+            return True
+        if status:
+            return False
+
+    response = getattr(exc, "http_resp", None)
+    try:
+        status = int(getattr(response, "status", 0) or 0)
+    except (TypeError, ValueError):
+        status = 0
+    if 500 <= status <= 599:
+        return True
+    if status:
+        return False
+
+    match = re.search(r"\b([45][0-9]{2})\b", str(exc))
+    if match:
+        return 500 <= int(match.group(1)) <= 599
+
+    error_name = type(exc).__name__.lower()
+    error_text = str(exc).lower()
+    return any(
+        marker in error_name or marker in error_text
+        for marker in (
+            "timeout",
+            "timed out",
+            "connection",
+            "disconnect",
+            "connector",
+            "temporarily unavailable",
+        )
+    )
 
 
 def account_snapshot_freshness(
@@ -2852,6 +2902,7 @@ class VariationalToLighterRuntime:
         self._last_live_inventory_entry_blocked_log: dict[tuple[str, str], float] = {}
         self.live_inventory_disk_entry_blocked = False
         self.live_inventory_last_disk_entry_block_log_monotonic = 0.0
+        self.live_inventory_lighter_eth_leverage_ready: bool | None = None
         self._last_live_inventory_exit_blocked_log: dict[tuple[Any, str], float] = {}
         self._last_auto_live_precheck_failure_log: dict[tuple[str, int, str, str, str], float] = {}
         self.paper_last_closed_monotonic: float | None = None
@@ -2865,6 +2916,7 @@ class VariationalToLighterRuntime:
         self.trade_task: asyncio.Task[None] | None = None
         self.spread_task: asyncio.Task[None] | None = None
         self.paper_task: asyncio.Task[None] | None = None
+        self.live_inventory_lighter_eth_leverage_task: asyncio.Task[None] | None = None
         self.auto_live_task: asyncio.Task[None] | None = None
         self.dashboard_task: asyncio.Task[None] | None = None
         self.watchdog_task: asyncio.Task[None] | None = None
@@ -4988,22 +5040,259 @@ class VariationalToLighterRuntime:
         client = self.initialize_lighter_client()
         from lighter import AccountApi
 
-        result = await AccountApi(client.api_client).account(
-            by="index",
-            value=str(self.account_index),
+        account_api = AccountApi(client.api_client)
+        max_attempts = len(LIGHTER_ACCOUNT_READ_RETRY_DELAYS_SECONDS) + 1
+        for attempt in range(max_attempts):
+            try:
+                result = await account_api.account(
+                    by="index",
+                    value=str(self.account_index),
+                    _request_timeout=10.0,
+                )
+                if hasattr(result, "to_dict"):
+                    result = result.to_dict()
+                elif hasattr(result, "model_dump"):
+                    result = result.model_dump(mode="json")
+                if not isinstance(result, dict):
+                    raise RuntimeError("Lighter account response is not an object")
+                if result.get("code") not in {None, 0, 200}:
+                    raise RuntimeError(
+                        "Lighter account request failed: "
+                        f"code={result.get('code')} message={result.get('message')}"
+                    )
+                return result
+            except Exception as exc:
+                if (
+                    attempt + 1 >= max_attempts
+                    or not is_retryable_lighter_account_read_error(exc)
+                ):
+                    raise
+                delay = LIGHTER_ACCOUNT_READ_RETRY_DELAYS_SECONDS[attempt]
+                logging.warning(
+                    "Transient Lighter account read failure; retrying "
+                    "attempt=%s/%s error_type=%s delay_seconds=%.2f",
+                    attempt + 1,
+                    max_attempts,
+                    type(exc).__name__,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+        raise RuntimeError("Lighter account read exhausted retries")
+
+    async def configure_lighter_eth_max_leverage(self) -> dict[str, Any]:
+        if self.ticker != "ETH":
+            raise RuntimeError(
+                f"Expected Lighter ETH market, got {self.ticker or 'unresolved'}"
+            )
+        if self.account_index is None:
+            raise RuntimeError("LIGHTER_ACCOUNT_INDEX is not loaded")
+        if self.api_key_index is None:
+            raise RuntimeError("LIGHTER_API_KEY_INDEX is not loaded")
+
+        market_id = int(self.lighter_market_index)
+        client = self.initialize_lighter_client()
+        from lighter import OrderApi
+
+        market_result = await OrderApi(client.api_client).order_book_details(
+            market_id=market_id,
             _request_timeout=10.0,
         )
-        if hasattr(result, "to_dict"):
-            result = result.to_dict()
-        elif hasattr(result, "model_dump"):
-            result = result.model_dump(mode="json")
-        if not isinstance(result, dict):
-            raise RuntimeError("Lighter account response is not an object")
-        if result.get("code") not in {None, 0, 200}:
+        if hasattr(market_result, "to_dict"):
+            market_result = market_result.to_dict()
+        elif hasattr(market_result, "model_dump"):
+            market_result = market_result.model_dump(mode="json")
+        if not isinstance(market_result, dict):
+            raise RuntimeError("Lighter market details response is not an object")
+        if market_result.get("code") not in {None, 0, 200}:
             raise RuntimeError(
-                f"Lighter account request failed: code={result.get('code')} message={result.get('message')}"
+                "Lighter market details request failed: "
+                f"code={market_result.get('code')} "
+                f"message={market_result.get('message')}"
             )
-        return result
+
+        markets = market_result.get("order_book_details")
+        if not isinstance(markets, list):
+            raise RuntimeError("Lighter market details response has no market list")
+        market = next(
+            (
+                item
+                for item in markets
+                if isinstance(item, dict)
+                and to_decimal(item.get("market_id")) == Decimal(market_id)
+                and str(item.get("symbol") or "").upper() == "ETH"
+                and str(item.get("market_type") or "").lower() == "perp"
+            ),
+            None,
+        )
+        if market is None:
+            raise RuntimeError(
+                f"Lighter ETH perp market details missing for market_id={market_id}"
+            )
+        try:
+            min_initial_margin_fraction = int(
+                market["min_initial_margin_fraction"]
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "Lighter ETH market has invalid min_initial_margin_fraction"
+            ) from exc
+        if not 1 <= min_initial_margin_fraction <= 10_000:
+            raise RuntimeError(
+                "Lighter ETH market min_initial_margin_fraction is out of range: "
+                f"{min_initial_margin_fraction}"
+            )
+        max_leverage = 10_000 // min_initial_margin_fraction
+        target_initial_margin_fraction = 10_000 // max_leverage
+
+        async def read_eth_settings() -> tuple[Decimal, int]:
+            account_result = await self.fetch_lighter_account()
+            accounts = account_result.get("accounts")
+            if not isinstance(accounts, list):
+                raise RuntimeError("Lighter account response has no accounts list")
+            account = next(
+                (
+                    item
+                    for item in accounts
+                    if isinstance(item, dict)
+                    and to_decimal(item.get("index"))
+                    == Decimal(self.account_index)
+                ),
+                None,
+            )
+            if account is None:
+                raise RuntimeError(
+                    f"Lighter account {self.account_index} missing from response"
+                )
+            positions = account.get("positions")
+            if not isinstance(positions, list):
+                raise RuntimeError("Lighter account response has no positions list")
+            position = next(
+                (
+                    item
+                    for item in positions
+                    if isinstance(item, dict)
+                    and to_decimal(item.get("market_id")) == Decimal(market_id)
+                    and str(item.get("symbol") or "").upper() == "ETH"
+                ),
+                None,
+            )
+            if position is None:
+                raise RuntimeError(
+                    "Lighter ETH leverage settings are absent from the account response"
+                )
+            margin_fraction_pct = to_decimal(
+                position.get("initial_margin_fraction")
+            )
+            margin_mode_value = to_decimal(position.get("margin_mode"))
+            if margin_fraction_pct is None or margin_fraction_pct <= 0:
+                raise RuntimeError(
+                    "Lighter ETH account has invalid initial_margin_fraction"
+                )
+            if margin_mode_value not in {Decimal("0"), Decimal("1")}:
+                raise RuntimeError("Lighter ETH account has invalid margin_mode")
+            return margin_fraction_pct * Decimal("100"), int(margin_mode_value)
+
+        current_initial_margin_fraction, margin_mode = await read_eth_settings()
+        already_configured = current_initial_margin_fraction == Decimal(
+            target_initial_margin_fraction
+        )
+        previous_initial_margin_fraction = current_initial_margin_fraction
+        if not already_configured:
+            tx_info, tx_response, error = await client.update_leverage(
+                market_index=market_id,
+                margin_mode=margin_mode,
+                leverage=max_leverage,
+            )
+            if error is not None:
+                raise RuntimeError(
+                    f"Lighter ETH max leverage update failed: {error}"
+                )
+            if tx_info is None or tx_response is None:
+                raise RuntimeError(
+                    "Lighter ETH max leverage update returned no transaction response"
+                )
+            if hasattr(tx_response, "to_dict"):
+                tx_response = tx_response.to_dict()
+            elif hasattr(tx_response, "model_dump"):
+                tx_response = tx_response.model_dump(mode="json")
+            response_code = (
+                tx_response.get("code") if isinstance(tx_response, dict) else None
+            )
+            if response_code not in {None, 0, 200}:
+                raise RuntimeError(
+                    "Lighter ETH max leverage update rejected: "
+                    f"code={response_code}"
+                )
+
+            for attempt in range(20):
+                await asyncio.sleep(0.5)
+                try:
+                    current_initial_margin_fraction, confirmed_margin_mode = (
+                        await read_eth_settings()
+                    )
+                except Exception:
+                    if attempt == 19:
+                        raise
+                    continue
+                if (
+                    current_initial_margin_fraction
+                    == Decimal(target_initial_margin_fraction)
+                    and confirmed_margin_mode == margin_mode
+                ):
+                    break
+            else:
+                raise RuntimeError(
+                    "Lighter ETH max leverage update was not confirmed by account readback"
+                )
+
+        return {
+            "asset": "ETH",
+            "market_id": market_id,
+            "max_allowed_leverage": max_leverage,
+            "initial_margin_fraction_bps": target_initial_margin_fraction,
+            "margin_mode": margin_mode,
+            "previous_initial_margin_fraction_bps": decimal_to_str(
+                previous_initial_margin_fraction
+            ),
+            "already_configured": already_configured,
+        }
+
+    async def setup_live_inventory_lighter_eth_max_leverage(self) -> None:
+        try:
+            leverage_context = await self.configure_lighter_eth_max_leverage()
+        except Exception as exc:
+            leverage_context = {
+                "asset": "ETH",
+                "reason": "lighter_eth_max_leverage_unconfirmed",
+                "error_type": type(exc).__name__,
+                "error": str(exc)[:300],
+                "action": "block_new_entries_manage_existing_positions",
+            }
+            self.live_inventory_lighter_eth_leverage_ready = False
+            self.live_inventory_lighter_eth_leverage_setup_context = (
+                leverage_context
+            )
+            self.logger.exception(
+                "live_inventory_lighter_eth_max_leverage_setup_failed"
+            )
+            with contextlib.suppress(Exception):
+                await self.append_live_inventory_log(
+                    "live_inventory_lighter_eth_max_leverage_failed",
+                    leverage_context,
+                )
+            return
+
+        self.live_inventory_lighter_eth_leverage_ready = True
+        self.live_inventory_lighter_eth_leverage_setup_context = leverage_context
+        self.logger.info(
+            "live_inventory_lighter_eth_max_leverage_ready %s",
+            json.dumps(leverage_context, ensure_ascii=True, sort_keys=True),
+        )
+        with contextlib.suppress(Exception):
+            await self.append_live_inventory_log(
+                "live_inventory_lighter_eth_max_leverage_ready",
+                leverage_context,
+            )
 
     async def fetch_lighter_active_orders(self) -> list[dict[str, Any]]:
         if self.account_index is None or self.api_key_index is None:
@@ -5373,13 +5662,30 @@ class VariationalToLighterRuntime:
         if not healthy_for_gate:
             self.live_inventory_account_recovery_required = True
             self.live_inventory_account_recovery_confirm_count = 0
-            if not startup_confirmation:
-                self.live_inventory_account_recovery_reason = str(
+            if not startup_confirmation or result.get("risk_action") != "normal":
+                current_reason = str(
                     result.get("risk_reason")
                     or result.get("variational_account_snapshot_freshness_reason")
                     or "variational_account_snapshot_stale"
                 )
-            elif result.get("risk_action") == "normal":
+                if current_reason == "account_equity_unavailable":
+                    missing_variational = result.get("variational_equity_usd") in (
+                        None,
+                        "",
+                    )
+                    missing_lighter = result.get("lighter_equity_usd") in (
+                        None,
+                        "",
+                    )
+                    if missing_variational and missing_lighter:
+                        current_reason = "both_accounts_equity_unavailable"
+                    elif missing_variational:
+                        current_reason = "variational_account_equity_unavailable"
+                    elif missing_lighter:
+                        current_reason = "lighter_account_equity_unavailable"
+                    result["risk_reason"] = current_reason
+                self.live_inventory_account_recovery_reason = current_reason
+            if startup_confirmation and result.get("risk_action") == "normal":
                 result["risk_action"] = "block_entry"
                 result["risk_reason"] = (
                     "variational_account_recovery_confirmation_pending"
@@ -5417,7 +5723,10 @@ class VariationalToLighterRuntime:
             else:
                 result["risk_action"] = "block_entry"
                 result["risk_reason"] = (
-                    "variational_account_recovery_confirmation_pending"
+                    recovery_reason
+                    if recovery_reason
+                    and recovery_reason != "startup_confirmation_required"
+                    else "variational_account_recovery_confirmation_pending"
                 )
                 self.clear_live_inventory_entry_confirmations_after_account_recovery()
 
@@ -7206,6 +7515,13 @@ class VariationalToLighterRuntime:
             )
             return
         asset = self.live_inventory_state_asset()
+        saved_state = self.load_live_inventory_state()
+        balanced_entry_recovery = (
+            bool(getattr(self, "live_inventory_i_accept_open_state_resume", False))
+            and saved_state.get("status") == "manual_review_required"
+            and saved_state.get("manual_review_reason")
+            == "basis_entry_lighter_submit_after_var_fill_failed"
+        )
         persisted_pending_actions = list(
             getattr(
                 self,
@@ -7254,6 +7570,23 @@ class VariationalToLighterRuntime:
                 },
             )
             raise RuntimeError("Live inventory startup reconcile failed: could not verify both exchange positions")
+
+        if balanced_entry_recovery:
+            if persisted_pending_actions:
+                raise RuntimeError(
+                    "Live inventory startup reconcile failed: interrupted entry still has pending actions"
+                )
+            try:
+                var_orders = await self.fetch_all_variational_pending_orders(asset=asset)
+                lighter_orders = await self.fetch_lighter_active_orders()
+            except Exception as exc:
+                raise RuntimeError(
+                    "Live inventory startup reconcile failed: could not verify both venues have no active orders"
+                ) from exc
+            if var_orders or lighter_orders:
+                raise RuntimeError(
+                    "Live inventory startup reconcile failed: active orders remain on an exchange"
+                )
 
         expected_qty = sum((to_decimal(lot.get("qty")) or Decimal("0")) for lot in self.live_inventory_open_lots)
         tolerance = self.live_inventory_position_qty_tolerance(expected_qty)
@@ -7317,6 +7650,11 @@ class VariationalToLighterRuntime:
             if expected_direction == DIRECTION_LONG_VAR_SHORT_LIGHTER
             else None
         )
+        expected_var_sign = -expected_lighter_sign if expected_lighter_sign is not None else None
+        var_direction_matches = (
+            expected_var_sign is not None
+            and variational_position_qty * expected_var_sign > 0
+        )
         lighter_direction_matches = (
             expected_lighter_sign is not None
             and lighter_position_qty * expected_lighter_sign > 0
@@ -7326,6 +7664,7 @@ class VariationalToLighterRuntime:
             or expected_direction is None
             or abs(var_abs - expected_qty) > tolerance
             or abs(lighter_abs - expected_qty) > tolerance
+            or not var_direction_matches
             or not lighter_direction_matches
         ):
             await self.require_live_inventory_manual_review(
@@ -7336,6 +7675,7 @@ class VariationalToLighterRuntime:
                     "expected_open_qty": decimal_to_str(expected_qty),
                     "expected_direction": expected_direction,
                     "expected_lighter_sign": decimal_to_str(expected_lighter_sign),
+                    "expected_var_sign": decimal_to_str(expected_var_sign),
                     "variational_position_qty": decimal_to_str(variational_position_qty),
                     "lighter_position_qty": decimal_to_str(lighter_position_qty),
                     "qty_tolerance": decimal_to_str(tolerance),
@@ -13452,6 +13792,10 @@ class VariationalToLighterRuntime:
                         and manual_reason
                         in LIVE_INVENTORY_OPEN_STATE_RESUME_MANUAL_REASONS
                         and bool(open_lots)
+                        and (
+                            manual_reason != "basis_entry_lighter_submit_after_var_fill_failed"
+                            or not pending_actions
+                        )
                     )
                     recoverable_pending_intent = (
                         state_status == "pending"
@@ -20165,6 +20509,34 @@ class VariationalToLighterRuntime:
                         },
                     )
                     return
+                if (
+                    asset == "ETH"
+                    and getattr(
+                        self,
+                        "live_inventory_lighter_eth_leverage_ready",
+                        None,
+                    )
+                    is False
+                ):
+                    self.live_inventory_basis_entry_confirm_counts.clear()
+                    reason = "lighter_eth_max_leverage_unconfirmed"
+                    if self.should_log_live_inventory_entry_blocked(
+                        direction=direction,
+                        reason=reason,
+                    ):
+                        await self.block_live_inventory_entry(
+                            asset=asset,
+                            reason=reason,
+                            context={
+                                "action": "block_new_entries_manage_existing_positions",
+                                "leverage_setup": getattr(
+                                    self,
+                                    "live_inventory_lighter_eth_leverage_setup_context",
+                                    {},
+                                ),
+                            },
+                        )
+                    return
                 account_risk = await self.live_inventory_account_risk_context(
                     proposed_notional_usd=proposed_total_notional_usd
                 )
@@ -26242,6 +26614,14 @@ class VariationalToLighterRuntime:
             if not self.live_inventory_dry_decisions:
                 await self.reconcile_live_inventory_startup_state()
 
+        if (
+            self.is_live_mode()
+            and self.is_live_inventory_enabled()
+            and not self.live_inventory_dry_decisions
+            and initial_asset.upper() == "ETH"
+        ):
+            self.live_inventory_lighter_eth_leverage_ready = False
+
         if self.live_inventory_force_close_open_state:
             await self.append_live_inventory_log(
                 "live_inventory_operator_exit_requested",
@@ -26272,6 +26652,13 @@ class VariationalToLighterRuntime:
             self.live_inventory_account_risk_task = self.track_background_task(
                 asyncio.create_task(self.live_inventory_account_risk_loop()),
                 "live_inventory_account_risk_loop",
+            )
+        if self.live_inventory_lighter_eth_leverage_ready is False:
+            self.live_inventory_lighter_eth_leverage_task = self.track_background_task(
+                asyncio.create_task(
+                    self.setup_live_inventory_lighter_eth_max_leverage()
+                ),
+                "live_inventory_lighter_eth_max_leverage_setup",
             )
         self.dashboard_task = self.track_background_task(asyncio.create_task(self.dashboard_loop()), "dashboard_loop")
 
@@ -26400,6 +26787,15 @@ class VariationalToLighterRuntime:
                 size_ladder_shadow_task,
                 return_exceptions=True,
             )
+
+        leverage_setup_task = getattr(
+            self,
+            "live_inventory_lighter_eth_leverage_task",
+            None,
+        )
+        if leverage_setup_task is not None and not leverage_setup_task.done():
+            leverage_setup_task.cancel()
+            await asyncio.gather(leverage_setup_task, return_exceptions=True)
 
         account_risk_task = getattr(
             self,

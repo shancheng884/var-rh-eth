@@ -527,6 +527,34 @@ def test_live_tool_resume_accepts_only_clean_recoverable_open_state(
     assert exit_fill_ok is True
     assert "strict_exchange_reconcile_required=true" in exit_fill_message
 
+    state_path.write_text(
+        json.dumps(
+            {
+                **base_state,
+                "manual_review_reason": "basis_entry_lighter_submit_after_var_fill_failed",
+            }
+        ),
+        encoding="utf-8",
+    )
+    balanced_ok, _ = validate_state(
+        LiveConfig(v4_live_mode=True), resume_open_position=True
+    )
+    state_path.write_text(
+        json.dumps(
+            {
+                **base_state,
+                "manual_review_reason": "basis_entry_lighter_submit_after_var_fill_failed",
+                "pending_actions": [{"role": "unresolved_entry"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    unresolved_ok, _ = validate_state(
+        LiveConfig(v4_live_mode=True), resume_open_position=True
+    )
+    assert balanced_ok is True
+    assert unresolved_ok is False
+
     assert pending_ok is True
     assert "pending_actions=1" in pending_message
     assert "strict_exchange_reconcile_required=true" in pending_message

@@ -211,6 +211,58 @@ def test_watchdog_uses_debounced_account_risk_notification_state() -> None:
     assert incidents[0].rearm_seconds == 900
 
 
+def test_lighter_outage_and_recovery_confirmation_keep_one_incident_key() -> None:
+    now = datetime(2026, 8, 30, 0, 0, tzinfo=timezone.utc)
+    state = {
+        "status": "open",
+        "asset": "ETH",
+        "open_lots": [{"lot_id": 1}],
+        "updated_at": now.isoformat(),
+    }
+    failure = {
+        "updated_at": now.isoformat(),
+        "risk_action": "block_entry",
+        "risk_reason": "lighter_account_equity_unavailable",
+        "risk_notification_action": "block_entry",
+        "risk_notification_reason": "lighter_account_equity_unavailable",
+    }
+    confirming = {
+        **failure,
+        "account_recovery_required": True,
+        "account_recovery_confirm_count": 2,
+        "account_recovery_confirm_samples": 3,
+    }
+
+    failure_incidents = evaluate_incidents(
+        state=state,
+        risk_health=failure,
+        events=[],
+        strategy_running=True,
+        config=config(),
+        now=now,
+    )
+    confirming_incidents = evaluate_incidents(
+        state=state,
+        risk_health=confirming,
+        events=[],
+        strategy_running=True,
+        config=config(),
+        now=now,
+    )
+
+    failure_risk = next(
+        item for item in failure_incidents if item.key.startswith("data_visibility:")
+    )
+    confirming_risk = next(
+        item
+        for item in confirming_incidents
+        if item.key.startswith("data_visibility:")
+    )
+    assert failure_risk.key == confirming_risk.key
+    assert failure_risk.key == "data_visibility:lighter_account_equity_unavailable"
+    assert "Lighter" in failure_risk.message
+
+
 def test_empty_pending_intent_does_not_raise_stale_action_incident() -> None:
     now = datetime(2026, 8, 30, 0, 1, tzinfo=timezone.utc)
     incidents = evaluate_incidents(

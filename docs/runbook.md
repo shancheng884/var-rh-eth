@@ -155,6 +155,41 @@ completed cycles, return, and simple annualized return then accumulate from
 that checkpoint across later strategy restarts. Historical logs are retained
 for audit but excluded from the default report.
 
+For an RH ETH strategy that began without a reporting baseline and now has an
+open position, do not use `--reset-baseline`. Stop the RH strategy first, keep
+the position untouched, and preview a historical rebuild instead:
+
+```bash
+cd /home/ubuntu/var-rh-eth
+source .venv/bin/activate
+python tools/bootstrap_rh_pnl_baseline.py
+```
+
+The preview prints the first RH live date, starting two-venue capital, verified
+closed PnL and volume, last flat-equity discrepancy, and a history digest.
+Verify that there were no unrecorded deposits or withdrawals and that the
+capital agrees with the RH start-day account snapshot. If the preview is
+correct, create the baseline with the printed digest:
+
+```bash
+python tools/bootstrap_rh_pnl_baseline.py --apply --expect-digest '<history_digest>' --i-confirm-no-unrecorded-transfers
+python tools/daily_pnl_report.py --asset ETH --day today --dry-run
+```
+
+The bootstrap refuses an existing baseline, a running strategy, incomplete
+history, or a last-flat unexplained account change over 1 USD. It does not
+trade or send a notification. If it refuses, inspect the account transfers and
+historical snapshots rather than forcing a baseline. Before enabling the RH
+daily timer, disable the old mainnet timer to prevent mixed or duplicate
+reports:
+
+```bash
+sudo systemctl disable --now var-lighter-daily-pnl.timer
+sudo cp deploy/systemd/var-rh-daily-pnl.{service,timer} /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now var-rh-daily-pnl.timer
+```
+
 ## V4 Exit Confirmation
 
 V4 uses the latest executable quote plus two qualifying observations in the
