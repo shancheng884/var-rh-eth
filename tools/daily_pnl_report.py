@@ -27,6 +27,11 @@ from tools.lib.pnl_baseline import (  # noqa: E402
     parse_timestamp,
     pnl_day_summary,
 )
+from tools.lib.account_equity_ledger import (  # noqa: E402
+    load_account_equity_state,
+    read_fresh_account_equity,
+    record_account_equity_sample,
+)
 from tools.lib.telegram_notifier import (  # noqa: E402
     TelegramNotifier,
     format_telegram_trade_message,
@@ -35,6 +40,8 @@ from tools.lib.telegram_notifier import (  # noqa: E402
 
 DEFAULT_BASELINE = ROOT / "log" / PNL_BASELINE_FILE_NAME
 DEFAULT_SEND_STATE = ROOT / "log" / "pnl_daily_telegram_state.json"
+DEFAULT_EQUITY_STATE = ROOT / "log" / "account_equity_daily_state.json"
+DEFAULT_RISK_HEALTH = ROOT / "log" / "live_inventory_risk_health.json"
 
 
 def decimal_value(value: Any) -> Decimal | None:
@@ -84,7 +91,16 @@ def build_daily_payload(
     asset: str,
     day: date,
     now: datetime | None = None,
+    equity_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    if baseline.get("return_basis") == "account_equity_delta":
+        return build_account_equity_payload(
+            baseline,
+            equity_state=equity_state or {},
+            asset=asset,
+            day=day,
+            now=now,
+        )
     record = pnl_day_summary(baseline, day.isoformat())
     capital = decimal_value(os.getenv("PNL_REPORT_CAPITAL_USD"))
     capital_source = "PNL_REPORT_CAPITAL_USD"
@@ -170,6 +186,89 @@ def build_daily_payload(
     }
 
 
+def build_account_equity_payload(
+    baseline: dict[str, Any],
+    *,
+    equity_state: dict[str, Any],
+    asset: str,
+    day: date,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    history = equity_state.get("daily_history") or {}
+    record = history.get(day.isoformat()) or {}
+    capital = decimal_value(baseline.get("account_baseline_equity_usd"))
+    daily_start = decimal_value(record.get("start_equity_usd"))
+    daily_latest = decimal_value(record.get("latest_equity_usd"))
+    sample_count = int(record.get("sample_count") or 0)
+    daily_pnl = (
+        daily_latest - daily_start
+        if sample_count >= 2 and daily_start is not None and daily_latest is not None
+        else None
+    )
+    latest_total = decimal_value(equity_state.get("latest_combined_equity_usd"))
+    if latest_total is None:
+        latest_total = decimal_value(baseline.get("latest_combined_equity_usd"))
+    cumulative_pnl = (
+        latest_total - capital
+        if latest_total is not None and capital is not None
+        else None
+    )
+    daily_return = (
+        daily_pnl / capital * Decimal("100")
+        if daily_pnl is not None and capital is not None and capital > 0
+        else None
+    )
+    cumulative_return = (
+        cumulative_pnl / capital * Decimal("100")
+        if cumulative_pnl is not None and capital is not None and capital > 0
+        else None
+    )
+    observed = now or datetime.now(timezone.utc)
+    baseline_at = parse_timestamp(
+        baseline.get("account_baseline_at") or baseline.get("started_at")
+    )
+    covered_days = beijing_calendar_days(baseline_at, observed)
+    annualized = (
+        cumulative_return * Decimal("365") / covered_days
+        if cumulative_return is not None and covered_days and covered_days > 0
+        else None
+    )
+    status = (
+        "complete" if record.get("coverage_complete")
+        else "partial" if daily_pnl is not None
+        else "unavailable"
+    )
+    return {
+        "asset": asset.upper(),
+        "summary_scope": "account_equity_daily",
+        "summary_status": status,
+        "beijing_day": day.isoformat(),
+        "reporting_timezone": "Asia/Shanghai",
+        "beijing_day_actual_pnl_usd": str(daily_pnl) if daily_pnl is not None else None,
+        "beijing_day_return_pct": str(daily_return) if daily_return is not None else None,
+        "daily_annualized_simple_pct": None,
+        "daily_equity_start_usd": str(daily_start) if daily_start is not None else None,
+        "daily_equity_latest_usd": str(daily_latest) if daily_latest is not None else None,
+        "daily_first_sample_at": record.get("first_sample_at"),
+        "daily_latest_sample_at": record.get("latest_sample_at"),
+        "daily_sample_count": sample_count,
+        "run_actual_pnl_usd": str(cumulative_pnl) if cumulative_pnl is not None else None,
+        "cumulative_four_leg_volume_usd": None,
+        "cumulative_closed_child_lots": None,
+        "return_pct": str(cumulative_return) if cumulative_return is not None else None,
+        "annualized_simple_pct": str(annualized) if annualized is not None else None,
+        "covered_beijing_days": str(covered_days) if covered_days is not None else None,
+        "capital_usd": str(capital) if capital is not None else None,
+        "capital_source": "verified_start_day_two_venue_equity" if capital is not None else "unavailable",
+        "variational_equity_usd": equity_state.get("latest_variational_equity_usd") or baseline.get("latest_variational_equity_usd"),
+        "lighter_equity_usd": equity_state.get("latest_lighter_equity_usd") or baseline.get("latest_lighter_equity_usd"),
+        "combined_equity_usd": str(latest_total) if latest_total is not None else None,
+        "account_snapshot_at": equity_state.get("last_sample_at") or baseline.get("latest_account_snapshot_at"),
+        "return_pnl_source": "account_equity_delta",
+        "annualized_reliability": "account_equity_observation_period",
+    }
+
+
 def send_with_retry(
     notifier: TelegramNotifier,
     message: str,
@@ -194,6 +293,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--day", default="yesterday")
     parser.add_argument("--baseline-path", type=Path, default=DEFAULT_BASELINE)
     parser.add_argument("--state-path", type=Path, default=DEFAULT_SEND_STATE)
+    parser.add_argument("--equity-state-path", type=Path, default=DEFAULT_EQUITY_STATE)
+    parser.add_argument("--risk-health-path", type=Path, default=DEFAULT_RISK_HEALTH)
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--attempts", type=int, default=3)
@@ -209,6 +310,20 @@ def main() -> int:
         return 0
     if str(baseline.get("asset") or "").upper() not in {"", args.asset.upper()}:
         raise SystemExit("daily_pnl=FAILED baseline_asset_mismatch")
+    equity_state = load_account_equity_state(args.equity_state_path)
+    if baseline.get("return_basis") == "account_equity_delta" and not args.dry_run:
+        sample, sample_reason = read_fresh_account_equity(
+            args.risk_health_path,
+            asset=args.asset,
+        )
+        if sample is not None:
+            equity_state = record_account_equity_sample(
+                args.equity_state_path,
+                sample,
+            )
+            print(f"account_equity_sample=RECORDED at={sample['captured_at']}")
+        else:
+            print(f"account_equity_sample=SKIPPED reason={sample_reason}")
     target_day = resolve_day(args.day)
     started_day = date.fromisoformat(
         str(baseline.get("current_beijing_day") or target_day.isoformat())
@@ -243,7 +358,15 @@ def main() -> int:
         baseline,
         asset=args.asset,
         day=target_day,
+        equity_state=equity_state,
     )
+    if (
+        baseline.get("return_basis") == "account_equity_delta"
+        and payload.get("beijing_day_actual_pnl_usd") is None
+        and not args.dry_run
+    ):
+        print(f"daily_pnl=SKIP account_equity_day_not_observed day={target_day.isoformat()}")
+        return 0
     message = format_telegram_trade_message(
         "live_inventory_pnl_summary",
         payload,

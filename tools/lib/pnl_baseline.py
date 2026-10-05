@@ -131,6 +131,11 @@ def normalize_pnl_baseline(value: dict[str, Any]) -> dict[str, Any]:
         "latest_account_snapshot_flat": value.get(
             "latest_account_snapshot_flat"
         ),
+        "return_basis": str(value.get("return_basis") or "confirmed_pair_fills"),
+        "account_baseline_source": value.get("account_baseline_source"),
+        "account_equity_tracking_started_at": value.get(
+            "account_equity_tracking_started_at"
+        ),
     }
 
 
@@ -229,6 +234,9 @@ def new_pnl_baseline(
             "daily_volume_counted_cycle_keys": [],
             "daily_external_cashflow_usd": "0",
             "daily_history": {},
+            "return_basis": "confirmed_pair_fills",
+            "account_baseline_source": None,
+            "account_equity_tracking_started_at": None,
         }
     )
 

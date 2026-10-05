@@ -47,6 +47,7 @@ DEFAULT_STATE = ROOT / "log" / "live_inventory_state.json"
 class HistoryPlan:
     first_run_at: str
     first_snapshot: dict[str, Any]
+    baseline_source: str
     latest_snapshot: dict[str, Any]
     cycles: list[dict[str, Any]]
     last_flat_residual_usd: Decimal | None
@@ -81,6 +82,96 @@ def _snapshot_equity(row: dict[str, Any]) -> Decimal:
     return combined
 
 
+def _risk_record_equity(row: dict[str, Any]) -> Decimal:
+    return _snapshot_equity(
+        {
+            **row,
+            "combined_equity_usd": row.get("combined_equity_usd"),
+        }
+    )
+
+
+def _pre_entry_risk_baseline(
+    rh_rows: list[dict[str, Any]],
+    *,
+    first_run: datetime,
+) -> dict[str, Any] | None:
+    entries = [
+        parse_time(row.get("logged_at"))
+        for row in rh_rows
+        if row.get("event") in {
+            "live_inventory_var_entry_submitted",
+            "live_inventory_lighter_entry_submitted",
+            "live_inventory_entered",
+        }
+    ]
+    first_entry = min((item for item in entries if item is not None), default=None)
+    flat_reconciles = [
+        row for row in rh_rows
+        if row.get("event") == "live_inventory_startup_reconcile_ok"
+        and row.get("status") == "both_exchanges_flat"
+        and parse_time(row.get("logged_at")) is not None
+        and parse_time(row.get("logged_at")) >= first_run
+    ]
+    risk_rows = [
+        row for row in rh_rows
+        if row.get("event") in {
+            "live_inventory_account_risk_alert",
+            "live_inventory_account_risk_recovered",
+        }
+        and parse_time(row.get("logged_at")) is not None
+        and parse_time(row.get("logged_at")) >= first_run
+        and beijing_day(row.get("logged_at")) == beijing_day(first_run)
+        and (first_entry is None or parse_time(row.get("logged_at")) < first_entry)
+        and row.get("open_lots_total") == 0
+        and row.get("variational_account_snapshot_fresh") is True
+        and row.get("variational_account_snapshot_usable") is True
+        and not row.get("lighter_risk_fetch_error")
+    ]
+    for index, first in enumerate(risk_rows):
+        first_at = parse_time(first.get("logged_at"))
+        if first_at is None or not first.get("run_id"):
+            continue
+        matching_flat = [
+            row for row in flat_reconciles
+            if row.get("run_id") == first.get("run_id")
+            and parse_time(row.get("logged_at")) is not None
+            and parse_time(row.get("logged_at")) <= first_at
+        ]
+        if not matching_flat:
+            continue
+        try:
+            first_equity = _risk_record_equity(first)
+        except ValueError:
+            continue
+        for second in risk_rows[index + 1:]:
+            second_at = parse_time(second.get("logged_at"))
+            if (
+                second_at is None
+                or second.get("run_id") != first.get("run_id")
+                or beijing_day(second_at) != beijing_day(first_at)
+                or (second_at - first_at).total_seconds() > 120
+            ):
+                continue
+            try:
+                second_equity = _risk_record_equity(second)
+            except ValueError:
+                continue
+            if abs(first_equity - second_equity) > Decimal("0.01"):
+                continue
+            return {
+                **first,
+                "snapshot_stage": "risk_pre_entry_confirmed",
+                "snapshot_status": "complete",
+                "snapshot_captured_at": first_at.isoformat(),
+                "account_snapshot_flat": True,
+                "open_lots_total": 0,
+                "baseline_confirmation_at": second_at.isoformat(),
+                "baseline_confirmation_equity_usd": str(second_equity),
+            }
+    return None
+
+
 def plan_history(rows: list[dict[str, Any]]) -> HistoryPlan:
     foreign_closes = [
         row for row in rows
@@ -109,9 +200,16 @@ def plan_history(rows: list[dict[str, Any]]) -> HistoryPlan:
         and _snapshot_time(row) is not None
         and _snapshot_time(row) >= first_run
     ]
-    if not flat_starts:
-        raise ValueError("first complete RH startup-flat account snapshot is missing")
-    first_snapshot = flat_starts[0]
+    baseline_source = "complete_startup_flat_snapshot"
+    if flat_starts:
+        first_snapshot = flat_starts[0]
+    else:
+        first_snapshot = _pre_entry_risk_baseline(rh_rows, first_run=first_run)
+        if first_snapshot is None:
+            raise ValueError(
+                "complete flat snapshot and verified pre-entry account-risk pair are missing"
+            )
+        baseline_source = "two_matching_pre_entry_account_risk_records"
     snapshot_at = _snapshot_time(first_snapshot)
     assert snapshot_at is not None
     if beijing_day(snapshot_at) != beijing_day(first_run):
@@ -175,6 +273,9 @@ def plan_history(rows: list[dict[str, Any]]) -> HistoryPlan:
     digest_payload = {
         "first_run_at": first_run.isoformat(),
         "first_snapshot_at": snapshot_at.isoformat(),
+        "baseline_source": baseline_source,
+        "baseline_run_id": first_snapshot.get("run_id"),
+        "baseline_confirmation_at": first_snapshot.get("baseline_confirmation_at"),
         "initial_equity_usd": str(initial_equity),
         "latest_snapshot_at": latest_snapshot_at.isoformat(),
         "latest_equity_usd": str(_snapshot_equity(latest_snapshot)),
@@ -196,6 +297,7 @@ def plan_history(rows: list[dict[str, Any]]) -> HistoryPlan:
     return HistoryPlan(
         first_run_at=first_run.isoformat(),
         first_snapshot=first_snapshot,
+        baseline_source=baseline_source,
         latest_snapshot=latest_snapshot,
         cycles=cycles,
         last_flat_residual_usd=residual,
@@ -204,14 +306,29 @@ def plan_history(rows: list[dict[str, Any]]) -> HistoryPlan:
 
 
 def build_baseline(plan: HistoryPlan, path: Path, *, observed_at: str) -> dict[str, Any]:
+    baseline = new_pnl_baseline(
+        asset="ETH",
+        realized_pnl_usd="0",
+        completed_cycles=0,
+        started_at=plan.first_run_at,
+    )
+    baseline.update(
+        {
+            "return_basis": "account_equity_delta",
+            "account_baseline_source": plan.baseline_source,
+            "account_baseline_run_id": plan.first_snapshot.get("run_id"),
+            "account_baseline_confirmation_at": plan.first_snapshot.get(
+                "baseline_confirmation_at"
+            ),
+            "account_equity_tracking_started_at": str(
+                plan.first_snapshot.get("snapshot_captured_at")
+                or plan.first_snapshot.get("logged_at")
+            ),
+        }
+    )
     write_pnl_baseline(
         path,
-        new_pnl_baseline(
-            asset="ETH",
-            realized_pnl_usd="0",
-            completed_cycles=0,
-            started_at=plan.first_run_at,
-        ),
+        baseline,
     )
     started = plan.first_snapshot
     set_pnl_account_baseline(
@@ -302,11 +419,17 @@ def main() -> int:
     print(f"rh_first_live_run_at={plan.first_run_at}")
     print(f"rh_starting_capital_usd={candidate['account_baseline_equity_usd']}")
     print(f"rh_account_baseline_at={candidate['account_baseline_at']}")
+    print(f"return_basis={candidate['return_basis']}")
+    print(f"account_baseline_source={candidate['account_baseline_source']}")
     print(f"confirmed_close_groups={candidate['tracked_completed_cycles']}")
     print(f"confirmed_pnl_usd={candidate['confirmed_pnl_usd']}")
     print(f"four_leg_volume_usd={candidate['confirmed_four_leg_volume_usd']}")
     print(f"latest_account_snapshot_at={candidate['latest_account_snapshot_at']}")
     print(f"latest_combined_equity_usd={candidate['latest_combined_equity_usd']}")
+    latest_equity = to_decimal(candidate.get("latest_combined_equity_usd"))
+    starting_equity = to_decimal(candidate.get("account_baseline_equity_usd"))
+    if latest_equity is not None and starting_equity is not None:
+        print(f"account_pnl_as_of_latest_snapshot_usd={latest_equity - starting_equity}")
     print(f"last_flat_unexplained_change_usd={plan.last_flat_residual_usd}")
     print(f"history_digest={plan.digest}")
     if not args.apply:

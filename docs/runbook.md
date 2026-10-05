@@ -165,21 +165,26 @@ source .venv/bin/activate
 python tools/bootstrap_rh_pnl_baseline.py
 ```
 
-The preview prints the first RH live date, starting two-venue capital, verified
-closed PnL and volume, last flat-equity discrepancy, and a history digest.
-Verify that there were no unrecorded deposits or withdrawals and that the
-capital agrees with the RH start-day account snapshot. If the preview is
-correct, create the baseline with the printed digest:
+The preview prints the RH start date, starting two-venue capital, latest
+available two-venue equity, account-equity PnL estimate, and a history digest.
+It uses a complete startup-flat account snapshot or, when that is unavailable,
+two matching fresh account-risk records after a verified flat startup and
+before the first entry. Verify that there were no unrecorded deposits or
+withdrawals and that the capital agrees with the start-day records. If the
+preview is correct, create the baseline with the printed digest:
 
 ```bash
 python tools/bootstrap_rh_pnl_baseline.py --apply --expect-digest '<history_digest>' --i-confirm-no-unrecorded-transfers
 python tools/daily_pnl_report.py --asset ETH --day today --dry-run
 ```
 
-The bootstrap refuses an existing baseline, a running strategy, incomplete
-history, or a last-flat unexplained account change over 1 USD. It does not
-trade or send a notification. If it refuses, inspect the account transfers and
-historical snapshots rather than forcing a baseline. Before enabling the RH
+The bootstrap refuses an existing baseline, a running strategy, unverified
+account records, or a last-flat unexplained account change over 1 USD. It does
+not trade or send a notification. The account-equity daily report samples the
+strategy's fresh two-venue risk health every five minutes. Cumulative return
+starts at the baseline equity; daily return starts at the first valid sample
+of each Beijing day. Older daily splits without equity samples are reported as
+unavailable. Stale or incomplete venue data is skipped. Before enabling the RH
 daily timer, disable the old mainnet timer to prevent mixed or duplicate
 reports:
 

@@ -253,6 +253,35 @@ def format_telegram_trade_message(
             ]
         )
     if event_type == "live_inventory_pnl_summary":
+        if payload.get("summary_scope") == "account_equity_daily":
+            status = {
+                "complete": "完整日",
+                "partial": "部分时段",
+                "unavailable": "数据不足",
+            }.get(str(_value(payload, "summary_status")), _value(payload, "summary_status"))
+            return "\n".join(
+                [
+                    "[Var/RH] 账户权益日报",
+                    f"日期：{_value(payload, 'beijing_day')}｜资产：{asset}｜状态：{status}",
+                    "当日权益变化："
+                    f"{_localized_money(payload, 'beijing_day_actual_pnl_usd')}",
+                    "当日收益率："
+                    f"{_localized_percent(payload, 'beijing_day_return_pct')}",
+                    "当日采样区间："
+                    f"{_value(payload, 'daily_first_sample_at')} 至 "
+                    f"{_value(payload, 'daily_latest_sample_at')}",
+                    "累计账户盈亏："
+                    f"{_localized_money(payload, 'run_actual_pnl_usd')}",
+                    "累计收益率："
+                    f"{_localized_percent(payload, 'return_pct')}",
+                    f"统计本金：{_localized_money(payload, 'capital_usd')}",
+                    f"Var 权益：{_localized_money(payload, 'variational_equity_usd')}",
+                    f"RH 权益：{_localized_money(payload, 'lighter_equity_usd')}",
+                    f"双边总权益：{_localized_money(payload, 'combined_equity_usd')}",
+                    f"权益快照：{_value(payload, 'account_snapshot_at')}",
+                    "口径：双边账户权益变化，包含持仓未实现盈亏及手动交易影响",
+                ]
+            )
         if payload.get("summary_scope") == "beijing_daily":
             return "\n".join(
                 [
