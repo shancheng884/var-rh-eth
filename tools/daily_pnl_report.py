@@ -196,6 +196,7 @@ def build_account_equity_payload(
 ) -> dict[str, Any]:
     history = equity_state.get("daily_history") or {}
     record = history.get(day.isoformat()) or {}
+    fill_record = pnl_day_summary(baseline, day.isoformat())
     capital = decimal_value(baseline.get("account_baseline_equity_usd"))
     daily_start = decimal_value(record.get("start_equity_usd"))
     daily_latest = decimal_value(record.get("latest_equity_usd"))
@@ -218,6 +219,7 @@ def build_account_equity_payload(
         if daily_pnl is not None and capital is not None and capital > 0
         else None
     )
+    daily_annualized = daily_return * Decimal("365") if daily_return is not None else None
     cumulative_return = (
         cumulative_pnl / capital * Decimal("100")
         if cumulative_pnl is not None and capital is not None and capital > 0
@@ -246,15 +248,37 @@ def build_account_equity_payload(
         "reporting_timezone": "Asia/Shanghai",
         "beijing_day_actual_pnl_usd": str(daily_pnl) if daily_pnl is not None else None,
         "beijing_day_return_pct": str(daily_return) if daily_return is not None else None,
-        "daily_annualized_simple_pct": None,
+        "daily_annualized_simple_pct": (
+            str(daily_annualized) if daily_annualized is not None else None
+        ),
         "daily_equity_start_usd": str(daily_start) if daily_start is not None else None,
         "daily_equity_latest_usd": str(daily_latest) if daily_latest is not None else None,
         "daily_first_sample_at": record.get("first_sample_at"),
         "daily_latest_sample_at": record.get("latest_sample_at"),
         "daily_sample_count": sample_count,
+        "daily_closed_child_lots": int(fill_record.get("closed_child_lots") or 0),
+        "daily_completed_close_groups": int(
+            fill_record.get("tracked_completed_cycles") or 0
+        ),
+        "daily_four_leg_volume_usd": str(
+            fill_record.get("four_leg_volume_usd") or "0"
+        ),
+        "daily_confirmed_pnl_usd": str(
+            fill_record.get("confirmed_pnl_usd") or "0"
+        ),
         "run_actual_pnl_usd": str(cumulative_pnl) if cumulative_pnl is not None else None,
-        "cumulative_four_leg_volume_usd": None,
-        "cumulative_closed_child_lots": None,
+        "cumulative_confirmed_pnl_usd": str(
+            baseline.get("confirmed_pnl_usd") or "0"
+        ),
+        "cumulative_four_leg_volume_usd": str(
+            baseline.get("confirmed_four_leg_volume_usd") or "0"
+        ),
+        "cumulative_completed_close_groups": int(
+            baseline.get("tracked_completed_cycles") or 0
+        ),
+        "cumulative_closed_child_lots": int(
+            baseline.get("tracked_closed_child_lots") or 0
+        ),
         "return_pct": str(cumulative_return) if cumulative_return is not None else None,
         "annualized_simple_pct": str(annualized) if annualized is not None else None,
         "covered_beijing_days": str(covered_days) if covered_days is not None else None,

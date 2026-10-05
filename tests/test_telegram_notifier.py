@@ -244,6 +244,42 @@ def test_telegram_daily_pnl_summary_contains_volume_and_both_annualized_views() 
     assert "累计四腿成交量：1723.1334 U" in message
 
 
+def test_telegram_rh_account_equity_report_uses_daily_standard_layout() -> None:
+    message = format_telegram_trade_message(
+        "live_inventory_pnl_summary",
+        {
+            "asset": "ETH",
+            "summary_scope": "account_equity_daily",
+            "summary_status": "unavailable",
+            "beijing_day": "2026-10-05",
+            "daily_closed_child_lots": 0,
+            "daily_completed_close_groups": 0,
+            "daily_four_leg_volume_usd": "0",
+            "daily_confirmed_pnl_usd": "0",
+            "beijing_day_actual_pnl_usd": None,
+            "beijing_day_return_pct": None,
+            "daily_annualized_simple_pct": None,
+            "cumulative_confirmed_pnl_usd": "0.064454",
+            "cumulative_four_leg_volume_usd": "557.93743",
+            "return_pct": "0.2551",
+            "annualized_simple_pct": "9.31",
+            "capital_usd": "241.774564",
+            "combined_equity_usd": "242.391379",
+            "variational_equity_usd": "127.269645",
+            "lighter_equity_usd": "115.121734",
+            "account_snapshot_at": "2026-10-04T19:06:18+00:00",
+        },
+    )
+
+    assert "[Var/RH] 北京时间每日收益" in message
+    assert "平仓子单：0 笔｜平仓批次：0 组" in message
+    assert "确认成交盈亏：0 U" in message
+    assert "当日账户权益变化：暂不可用" in message
+    assert "累计确认盈亏：0.064454 U" in message
+    assert "累计账户收益率：0.2551%" in message
+    assert "双边权益净变化" in message
+
+
 def test_telegram_pnl_summary_formats_long_decimals_and_missing_values() -> None:
     message = format_telegram_trade_message(
         "live_inventory_pnl_summary",
