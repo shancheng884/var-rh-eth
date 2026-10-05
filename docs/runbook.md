@@ -184,9 +184,16 @@ The bootstrap refuses an existing baseline, a running strategy, unverified
 account records, or a last-flat unexplained account change over 1 USD. It does
 not trade or send a notification. The account-equity daily report samples the
 strategy's fresh two-venue risk health every five minutes. Cumulative return
-starts at the baseline equity; daily return starts at the first valid sample
-of each Beijing day. Older daily splits without equity samples are reported as
-unavailable. Stale or incomplete venue data is skipped. Before enabling the RH
+starts at the verified RH start-day baseline equity and deducts recorded net
+deposits. It is a marked-to-market account return, not confirmed fill PnL. A
+Beijing-day return requires samples within ten minutes of both day boundaries
+and a known maximum gap of no more than fifteen minutes. Older ledger records
+without gap evidence and days missing either boundary are partial: the report
+may show the observed interval change but not a full-day return or daily
+annualization. Days without observations are reported as insufficient so
+scheduled catch-up can advance. Historical daily splits cannot be inferred
+from the cumulative return. Stale or incomplete venue samples are skipped.
+Before enabling the RH
 daily timer, disable the old mainnet timer to prevent mixed or duplicate
 reports:
 

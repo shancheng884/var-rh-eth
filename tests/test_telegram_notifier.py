@@ -275,9 +275,41 @@ def test_telegram_rh_account_equity_report_uses_daily_standard_layout() -> None:
     assert "平仓子单：0 笔｜平仓批次：0 组" in message
     assert "确认成交盈亏：0 U" in message
     assert "当日账户权益变化：暂不可用" in message
+    assert "累计账户净收益：暂不可用" in message
     assert "累计确认盈亏：0.064454 U" in message
     assert "累计账户收益率：0.2551%" in message
     assert "双边权益净变化" in message
+
+
+def test_telegram_rh_partial_day_keeps_observed_change_separate() -> None:
+    message = format_telegram_trade_message(
+        "live_inventory_pnl_summary",
+        {
+            "asset": "ETH",
+            "summary_scope": "account_equity_daily",
+            "summary_status": "partial",
+            "beijing_day": "2026-10-05",
+            "daily_closed_child_lots": 6,
+            "daily_completed_close_groups": 1,
+            "daily_four_leg_volume_usd": "481.153476",
+            "daily_confirmed_pnl_usd": "0.06882",
+            "beijing_day_actual_pnl_usd": None,
+            "observed_period_change_usd": "2.2187743087798204",
+            "daily_first_sample_at": "2026-10-05T06:55:17+00:00",
+            "daily_latest_sample_at": "2026-10-05T15:59:49+00:00",
+            "run_actual_pnl_usd": "0.3021856912204016",
+            "return_pct": "0.1250",
+            "account_baseline_day": "2026-09-26",
+            "capital_usd": "241.774564",
+        },
+    )
+
+    assert "当日账户权益变化：暂不可用" in message
+    assert "已采样时段权益变化（非全天收益）：2.218774 U" in message
+    assert "当日收益率：" not in message
+    assert "当日简单年化：" not in message
+    assert "累计账户净收益：0.302186 U" in message
+    assert "统计起始日：2026-09-26" in message
 
 
 def test_telegram_pnl_summary_formats_long_decimals_and_missing_values() -> None:

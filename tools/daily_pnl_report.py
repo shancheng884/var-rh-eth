@@ -28,6 +28,7 @@ from tools.lib.pnl_baseline import (  # noqa: E402
     pnl_day_summary,
 )
 from tools.lib.account_equity_ledger import (  # noqa: E402
+    complete_beijing_equity_day,
     load_account_equity_state,
     read_fresh_account_equity,
     record_account_equity_sample,
@@ -46,9 +47,10 @@ DEFAULT_RISK_HEALTH = ROOT / "log" / "live_inventory_risk_health.json"
 
 def decimal_value(value: Any) -> Decimal | None:
     try:
-        return Decimal(str(value)) if value not in (None, "") else None
+        result = Decimal(str(value)) if value not in (None, "") else None
     except (InvalidOperation, TypeError, ValueError):
         return None
+    return result if result is not None and result.is_finite() else None
 
 
 def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
@@ -201,17 +203,28 @@ def build_account_equity_payload(
     daily_start = decimal_value(record.get("start_equity_usd"))
     daily_latest = decimal_value(record.get("latest_equity_usd"))
     sample_count = int(record.get("sample_count") or 0)
-    daily_pnl = (
+    observed_period_change = (
         daily_latest - daily_start
         if sample_count >= 2 and daily_start is not None and daily_latest is not None
+        else None
+    )
+    complete_day = complete_beijing_equity_day(record, day.isoformat())
+    daily_cashflow = decimal_value(fill_record.get("external_cashflow_usd"))
+    daily_pnl = (
+        observed_period_change - daily_cashflow
+        if complete_day and observed_period_change is not None and daily_cashflow is not None
         else None
     )
     latest_total = decimal_value(equity_state.get("latest_combined_equity_usd"))
     if latest_total is None:
         latest_total = decimal_value(baseline.get("latest_combined_equity_usd"))
+    cashflow_value = baseline.get("external_cashflow_usd")
+    external_cashflow = decimal_value(
+        "0" if cashflow_value in (None, "") else cashflow_value
+    )
     cumulative_pnl = (
-        latest_total - capital
-        if latest_total is not None and capital is not None
+        latest_total - capital - external_cashflow
+        if latest_total is not None and capital is not None and external_cashflow is not None
         else None
     )
     daily_return = (
@@ -225,7 +238,13 @@ def build_account_equity_payload(
         if cumulative_pnl is not None and capital is not None and capital > 0
         else None
     )
-    observed = now or datetime.now(timezone.utc)
+    observed = (
+        now
+        or parse_timestamp(
+            equity_state.get("last_sample_at") or baseline.get("latest_account_snapshot_at")
+        )
+        or datetime.now(timezone.utc)
+    )
     baseline_at = parse_timestamp(
         baseline.get("account_baseline_at") or baseline.get("started_at")
     )
@@ -236,8 +255,8 @@ def build_account_equity_payload(
         else None
     )
     status = (
-        "complete" if record.get("coverage_complete")
-        else "partial" if daily_pnl is not None
+        "complete" if daily_pnl is not None
+        else "partial" if observed_period_change is not None
         else "unavailable"
     )
     return {
@@ -247,6 +266,11 @@ def build_account_equity_payload(
         "beijing_day": day.isoformat(),
         "reporting_timezone": "Asia/Shanghai",
         "beijing_day_actual_pnl_usd": str(daily_pnl) if daily_pnl is not None else None,
+        "observed_period_change_usd": (
+            str(observed_period_change)
+            if not complete_day and observed_period_change is not None
+            else None
+        ),
         "beijing_day_return_pct": str(daily_return) if daily_return is not None else None,
         "daily_annualized_simple_pct": (
             str(daily_annualized) if daily_annualized is not None else None
@@ -283,6 +307,11 @@ def build_account_equity_payload(
         "annualized_simple_pct": str(annualized) if annualized is not None else None,
         "covered_beijing_days": str(covered_days) if covered_days is not None else None,
         "capital_usd": str(capital) if capital is not None else None,
+        "account_baseline_day": (
+            baseline_at.astimezone(BEIJING_TIMEZONE).date().isoformat()
+            if baseline_at is not None else None
+        ),
+        "external_cashflow_usd": str(external_cashflow) if external_cashflow is not None else None,
         "capital_source": "verified_start_day_two_venue_equity" if capital is not None else "unavailable",
         "variational_equity_usd": equity_state.get("latest_variational_equity_usd") or baseline.get("latest_variational_equity_usd"),
         "lighter_equity_usd": equity_state.get("latest_lighter_equity_usd") or baseline.get("latest_lighter_equity_usd"),
@@ -384,13 +413,6 @@ def main() -> int:
         day=target_day,
         equity_state=equity_state,
     )
-    if (
-        baseline.get("return_basis") == "account_equity_delta"
-        and payload.get("beijing_day_actual_pnl_usd") is None
-        and not args.dry_run
-    ):
-        print(f"daily_pnl=SKIP account_equity_day_not_observed day={target_day.isoformat()}")
-        return 0
     message = format_telegram_trade_message(
         "live_inventory_pnl_summary",
         payload,

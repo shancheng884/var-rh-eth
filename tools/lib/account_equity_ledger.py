@@ -10,7 +10,8 @@ from tools.lib.pnl_baseline import BEIJING_TIMEZONE, beijing_day, parse_timestam
 
 
 RISK_HEALTH_MAX_AGE_SECONDS = 60
-DAILY_EQUITY_STATE_SCHEMA = 1
+DAILY_EQUITY_STATE_SCHEMA = 2
+MAX_DAILY_SAMPLE_GAP_SECONDS = 900
 
 
 def _decimal(value: Any) -> Decimal | None:
@@ -97,6 +98,26 @@ def read_fresh_account_equity(
     )
 
 
+def complete_beijing_equity_day(record: dict[str, Any], day: str) -> bool:
+    try:
+        local_day = datetime.fromisoformat(day).date()
+        sample_count = int(record.get("sample_count") or 0)
+    except (TypeError, ValueError):
+        return False
+    first_at = parse_timestamp(record.get("first_sample_at"))
+    latest_at = parse_timestamp(record.get("latest_sample_at"))
+    max_gap = _decimal(record.get("max_sample_gap_seconds"))
+    if sample_count < 2 or first_at is None or latest_at is None or max_gap is None:
+        return False
+    day_start = datetime.combine(local_day, time.min, tzinfo=BEIJING_TIMEZONE)
+    day_end = day_start + timedelta(days=1)
+    return (
+        day_start <= first_at <= day_start + timedelta(minutes=10)
+        and day_end - timedelta(minutes=10) <= latest_at < day_end
+        and Decimal("0") <= max_gap <= MAX_DAILY_SAMPLE_GAP_SECONDS
+    )
+
+
 def record_account_equity_sample(
     path: Path,
     sample: dict[str, str],
@@ -116,10 +137,16 @@ def record_account_equity_sample(
     record = dict(history.get(day) or {})
     first_at = parse_timestamp(record.get("first_sample_at"))
     latest_at = parse_timestamp(record.get("latest_sample_at"))
+    max_gap = (
+        Decimal("0") if first_at is None
+        else _decimal(record.get("max_sample_gap_seconds"))
+    )
     start_equity = record.get("start_equity_usd")
     if first_at is None:
         start_equity = sample["combined_equity_usd"]
         first_at = observed
+    if latest_at is not None and max_gap is not None:
+        max_gap = max(max_gap, Decimal(str((observed - latest_at).total_seconds())))
     if latest_at is None or observed > latest_at:
         latest_at = observed
     record.update(
@@ -129,15 +156,10 @@ def record_account_equity_sample(
             "first_sample_at": first_at.isoformat(),
             "latest_sample_at": latest_at.isoformat(),
             "sample_count": int(record.get("sample_count") or 0) + 1,
+            "max_sample_gap_seconds": str(max_gap) if max_gap is not None else None,
         }
     )
-    local_day = observed.astimezone(BEIJING_TIMEZONE).date()
-    day_start = datetime.combine(local_day, time.min, tzinfo=BEIJING_TIMEZONE)
-    day_end = day_start + timedelta(days=1)
-    record["coverage_complete"] = (
-        first_at <= day_start + timedelta(minutes=10)
-        and latest_at >= day_end - timedelta(minutes=10)
-    )
+    record["coverage_complete"] = complete_beijing_equity_day(record, day)
     history[day] = record
     state.update(
         {
