@@ -133,8 +133,10 @@ python tools/daily_pnl_report.py --asset ETH --day today --force
 
 Install the independent systemd timer. It runs every five minutes, sends the
 previous completed Beijing day once, retries failed Telegram delivery, and
-catches up missed days after a VPS outage. It reads only the small ledger and
-continues working when the strategy process is stopped:
+catches up missed days after a VPS outage. In account-equity mode, valid equity
+samples require a fresh risk-health file from the running strategy; if the
+strategy is stopped or that data is stale, the reporter skips the sample and
+does not invent a daily return:
 
 ```bash
 sudo cp deploy/systemd/var-rh-daily-pnl.{service,timer} /etc/systemd/system/
