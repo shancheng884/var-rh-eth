@@ -7,6 +7,7 @@ import pytest
 
 from tools.bootstrap_rh_pnl_baseline import build_baseline, main, plan_history
 from tools.daily_pnl_report import build_daily_payload
+from tools.pnl_report import load_rows
 
 
 RH_FIELDS = {
@@ -122,6 +123,73 @@ def test_bootstrap_requires_first_complete_flat_snapshot():
     rows = [row for row in _history() if row.get("snapshot_stage") != "startup_flat"]
     with pytest.raises(ValueError, match="startup-flat account snapshot is missing"):
         plan_history(rows)
+
+
+def test_bootstrap_loads_pre_entry_risk_and_reconcile_events(tmp_path):
+    run_id = "liveinv-20260926T111117-0a0418f0"
+    rows = [
+        _row("live_inventory_run_config", "2026-09-26T10:53:31.393389+00:00"),
+        _row(
+            "live_inventory_startup_reconcile_ok",
+            "2026-09-26T11:11:22.937275+00:00",
+            run_id=run_id,
+            status="both_exchanges_flat",
+        ),
+        *[
+            _row(
+                event,
+                at,
+                run_id=run_id,
+                open_lots_total=0,
+                variational_account_snapshot_fresh=True,
+                variational_account_snapshot_usable=True,
+                variational_equity_usd="124.142763",
+                lighter_equity_usd="117.631801",
+                combined_equity_usd="241.774564",
+            )
+            for event, at in (
+                ("live_inventory_account_risk_alert", "2026-09-26T11:11:38.033900+00:00"),
+                ("live_inventory_account_risk_recovered", "2026-09-26T11:12:23.128842+00:00"),
+            )
+        ],
+        _row(
+            "live_inventory_var_entry_submitted",
+            "2026-09-28T01:12:48.347100+00:00",
+            run_id=run_id,
+        ),
+        _row(
+            "live_inventory_entered",
+            "2026-09-28T01:12:48.595685+00:00",
+            run_id=run_id,
+        ),
+        _snapshot(
+            "2026-09-28T01:12:49+00:00",
+            stage="entry_confirmed",
+            var="124.14",
+            lighter="117.63",
+            flat=False,
+        ),
+    ]
+    log_path = tmp_path / "order_metrics.jsonl"
+    log_path.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+
+    loaded = load_rows(
+        log_path,
+        asset="ETH",
+        include_events={
+            "live_inventory_startup_reconcile_ok",
+            "live_inventory_account_risk_alert",
+            "live_inventory_account_risk_recovered",
+            "live_inventory_var_entry_submitted",
+            "live_inventory_entered",
+        },
+    )
+    plan = plan_history(loaded)
+
+    assert plan.baseline_source == "two_matching_pre_entry_account_risk_records"
+    assert plan.first_snapshot["combined_equity_usd"] == "241.774564"
 
 
 def test_bootstrap_rejects_missing_verified_volume():

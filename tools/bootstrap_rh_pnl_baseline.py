@@ -41,6 +41,14 @@ from tools.pnl_report import (  # noqa: E402
 DEFAULT_LOG = ROOT / "log" / "order_metrics.jsonl"
 DEFAULT_BASELINE = ROOT / "log" / PNL_BASELINE_FILE_NAME
 DEFAULT_STATE = ROOT / "log" / "live_inventory_state.json"
+BASELINE_HISTORY_EVENTS = {
+    "live_inventory_startup_reconcile_ok",
+    "live_inventory_account_risk_alert",
+    "live_inventory_account_risk_recovered",
+    "live_inventory_var_entry_submitted",
+    "live_inventory_lighter_entry_submitted",
+    "live_inventory_entered",
+}
 
 
 @dataclass(frozen=True)
@@ -406,7 +414,13 @@ def main() -> int:
     if args.baseline_path.exists():
         raise SystemExit("bootstrap=REFUSED reason=baseline_already_exists")
     try:
-        plan = plan_history(load_rows(args.log_path, asset="ETH"))
+        plan = plan_history(
+            load_rows(
+                args.log_path,
+                asset="ETH",
+                include_events=BASELINE_HISTORY_EVENTS,
+            )
+        )
     except ValueError as exc:
         raise SystemExit(f"bootstrap=REFUSED reason={exc}") from exc
 

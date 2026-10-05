@@ -104,11 +104,17 @@ def reporting_period_since(
     ).astimezone(timezone.utc)
 
 
-def load_rows(path: Path, *, asset: str) -> list[dict[str, Any]]:
+def load_rows(
+    path: Path,
+    *,
+    asset: str,
+    include_events: set[str] | None = None,
+) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     if not path.exists():
         return rows
-    needles = tuple(f'"event": "{event}"' for event in RELEVANT_EVENTS)
+    relevant_events = RELEVANT_EVENTS | set(include_events or ())
+    needles = tuple(f'"event": "{event}"' for event in relevant_events)
     with path.open("r", encoding="utf-8", errors="ignore") as handle:
         for line in handle:
             if not any(needle in line for needle in needles):
@@ -117,7 +123,7 @@ def load_rows(path: Path, *, asset: str) -> list[dict[str, Any]]:
                 row = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if str(row.get("event") or "") not in RELEVANT_EVENTS:
+            if str(row.get("event") or "") not in relevant_events:
                 continue
             row_asset = str(row.get("asset") or "").upper()
             if row_asset and row_asset != asset:
