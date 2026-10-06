@@ -17,10 +17,88 @@ from tools.analyze import (
     build_basis_v2_replay,
     build_entry_semantics,
     dynamic_cost_summary,
+    build_v4_exit_observation_summary,
+    build_v4_exit_target_sensitivity,
     summarize_basis_v2_sweep_events,
     print_execution_calibration,
     print_v4_live_funnel,
 )
+
+
+def test_v4_exit_target_sensitivity_separates_open_unconfirmed_and_confirmed() -> None:
+    common = {
+        "run_id": "live-v4-exit-sensitivity",
+        "strategy_version": "basis-v4-live-v16-test",
+        "asset": "ETH",
+    }
+    rows = [
+        {
+            **common,
+            "event": "live_inventory_v4_exit_observation",
+            "observed_at": "2026-10-06T00:01:00Z",
+            "lots": [
+                {
+                    "lot_id": 1,
+                    "direction": "short_var_long_lighter",
+                    "executable_mfe_pnl_bps": "4.2",
+                    "effective_exit_target_bps": "4.5",
+                },
+                {
+                    "lot_id": 2,
+                    "direction": "short_var_long_lighter",
+                    "executable_mfe_pnl_bps": "3.7",
+                    "effective_exit_target_bps": "4.5",
+                },
+                {
+                    "lot_id": 3,
+                    "direction": "short_var_long_lighter",
+                    "executable_mfe_pnl_bps": "3.9",
+                    "effective_exit_target_bps": "4.5",
+                },
+            ],
+        },
+        {
+            **common,
+            "event": "live_inventory_exited",
+            "logged_at": "2026-10-06T00:02:00Z",
+            "lot_id": 1,
+            "direction": "short_var_long_lighter",
+            "effective_min_exit_pnl_bps": "4.5",
+            "executable_exit_mfe_pnl_bps": "4.2",
+        },
+        {
+            **common,
+            "event": "live_inventory_exited",
+            "logged_at": "2026-10-06T00:02:30Z",
+            "lot_id": 3,
+            "direction": "short_var_long_lighter",
+            "effective_min_exit_pnl_bps": "4.5",
+            "executable_exit_mfe_pnl_bps": "3.9",
+        },
+        {
+            **common,
+            "event": "live_inventory_actual_pnl",
+            "logged_at": "2026-10-06T00:03:00Z",
+            "lot_id": 1,
+            "actual_pnl_status": "lighter_final_fill_confirmed",
+            "actual_pnl_bps": "2.2",
+            "closed_child_lots": 1,
+        },
+    ]
+
+    lots = build_v4_exit_observation_summary(rows)
+    results = build_v4_exit_target_sensitivity(lots)
+    by_target = {str(row["target_bps"]): row for row in results}
+
+    assert by_target["3.5"]["peak_crossed_lots"] == 3
+    assert by_target["3.5"]["open_crossed_lots"] == 1
+    assert by_target["3.5"]["exited_without_confirmed_pnl"] == 1
+    assert by_target["3.5"]["confirmed_multi_lot_exits"] == 0
+    assert by_target["3.5"]["confirmed_single_lot_closes_crossed"] == 1
+    assert by_target["3.5"]["closed_crossed_below_recorded_target"] == 1
+    assert by_target["3.5"]["confirmed_actual_avg_pnl_bps"] == Decimal("2.2")
+    assert by_target["4.0"]["peak_crossed_lots"] == 1
+    assert by_target["4.5"]["peak_crossed_lots"] == 0
 
 
 def test_v4_live_funnel_flags_incompatible_immediate_arb_floor() -> None:

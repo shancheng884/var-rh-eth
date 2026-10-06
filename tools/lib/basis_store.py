@@ -184,21 +184,69 @@ def read_basis_samples(
     sample_kind_filter: str | None = None,
     sample_quality_filter: str | None = None,
     quote_size_mode_filter: str | None = None,
+    max_total_rows: int | None = None,
+    max_total_bytes: int | None = None,
+    max_line_bytes: int | None = None,
+    stats: dict[str, int] | None = None,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     paths_by_asset: dict[str, list[Path]] = {}
     for path in basis_sample_paths(root, asset_filter):
         paths_by_asset.setdefault(path.parent.name, []).append(path)
-    for paths in paths_by_asset.values():
-        asset_rows: deque[dict[str, Any]] = deque(maxlen=max(1, limit))
+    assets = sorted(paths_by_asset)
+    total_row_limit = max(
+        1, max_total_rows if max_total_rows is not None else limit
+    )
+    base_rows, extra_rows = divmod(total_row_limit, max(1, len(assets)))
+    total_byte_limit = max_total_bytes
+    base_bytes, extra_bytes = (
+        divmod(total_byte_limit, max(1, len(assets)))
+        if total_byte_limit is not None
+        else (None, None)
+    )
+    total_retained_bytes = 0
+    counters = stats if stats is not None else {}
+    counters.setdefault("oversized_lines", 0)
+    counters.setdefault("evicted_rows", 0)
+    for asset_index, asset in enumerate(assets):
+        paths = paths_by_asset[asset]
+        asset_row_limit = (
+            base_rows + (1 if asset_index < extra_rows else 0)
+            if max_total_rows is not None
+            else max(1, limit)
+        )
+        asset_byte_limit = (
+            base_bytes + (1 if asset_index < extra_bytes else 0)
+            if base_bytes is not None
+            else None
+        )
+        if asset_row_limit <= 0 or asset_byte_limit == 0:
+            continue
+        asset_rows: deque[tuple[dict[str, Any], int]] = deque()
+        retained_bytes = 0
         for path in sorted(paths, key=lambda item: item.name):
             opener = gzip.open if path.suffix == ".gz" else open
             try:
-                with opener(path, "rt", encoding="utf-8", errors="replace") as handle:
-                    for line in handle:
+                mode = "rb" if max_line_bytes is not None else "rt"
+                kwargs = {} if mode == "rb" else {"encoding": "utf-8", "errors": "replace"}
+                with opener(path, mode, **kwargs) as handle:
+                    while True:
+                        line = (
+                            handle.readline(max_line_bytes + 1)
+                            if max_line_bytes is not None
+                            else handle.readline()
+                        )
+                        if not line:
+                            break
+                        if max_line_bytes is not None and len(line) > max_line_bytes:
+                            counters["oversized_lines"] += 1
+                            while line and not line.endswith(b"\n"):
+                                line = handle.readline(max_line_bytes + 1)
+                            continue
+                        line_size = len(line) if isinstance(line, bytes) else len(line.encode("utf-8"))
                         try:
                             row = json.loads(line)
-                        except json.JSONDecodeError:
+                        except (json.JSONDecodeError, UnicodeDecodeError):
                             continue
                         if not isinstance(row, dict):
                             continue
@@ -220,9 +268,21 @@ def read_basis_samples(
                             != quote_size_mode_filter
                         ):
                             continue
-                        asset_rows.append(row)
+                        asset_rows.append((row, line_size))
+                        retained_bytes += line_size
+                        while len(asset_rows) > asset_row_limit or (
+                            asset_byte_limit is not None
+                            and retained_bytes > asset_byte_limit
+                        ):
+                            _, removed_bytes = asset_rows.popleft()
+                            retained_bytes -= removed_bytes
+                            counters["evicted_rows"] += 1
             except OSError:
                 continue
-        rows.extend(asset_rows)
+        rows.extend(row for row, _ in asset_rows)
+        total_retained_bytes += retained_bytes
     rows.sort(key=lambda row: str(row.get("logged_at") or ""))
-    return rows[-max(1, limit) :]
+    result = rows[-total_row_limit:]
+    counters["retained_rows"] = len(result)
+    counters["retained_bytes"] = total_retained_bytes
+    return result

@@ -18,6 +18,9 @@ RUNTIME_LOG = LOG_DIR / "runtime.log"
 COLLECTOR_LOG = LOG_DIR / "basis_collector.log"
 LIVE_STATE = LOG_DIR / "live_inventory_state.json"
 LIVE_CONTROL = LOG_DIR / "live_inventory_control.json"
+JSONL_TAIL_MAX_ROWS = 10000
+JSONL_TAIL_MAX_BYTES = 2 * 1024 * 1024
+JSONL_TAIL_MAX_LINE_BYTES = 256 * 1024
 
 
 def write_json_atomic(path: Path, value: dict[str, Any]) -> None:
@@ -37,18 +40,71 @@ def read_json(path: Path) -> dict[str, Any]:
         return {}
 
 
-def tail_jsonl(path: Path, limit: int) -> list[dict[str, Any]]:
-    rows: deque[dict[str, Any]] = deque(maxlen=max(1, limit))
+def _tail_jsonl_handles(
+    handles: Iterable[Any],
+    *,
+    limit: int,
+    max_bytes: int,
+    max_line_bytes: int,
+    stats: dict[str, int] | None = None,
+) -> list[dict[str, Any]]:
+    row_limit = min(JSONL_TAIL_MAX_ROWS, max(1, limit))
+    byte_limit = max(1, max_bytes)
+    line_limit = max(1, max_line_bytes)
+    raw_rows: deque[bytes] = deque()
+    retained_bytes = 0
+    counters = stats if stats is not None else {}
+    counters.setdefault("oversized_lines", 0)
+    counters.setdefault("evicted_rows", 0)
+
+    for handle in handles:
+        while True:
+            line = handle.readline(line_limit + 1)
+            if not line:
+                break
+            if len(line) > line_limit:
+                counters["oversized_lines"] += 1
+                while line and not line.endswith(b"\n"):
+                    line = handle.readline(line_limit + 1)
+                continue
+            raw_rows.append(line)
+            retained_bytes += len(line)
+            while len(raw_rows) > row_limit or retained_bytes > byte_limit:
+                retained_bytes -= len(raw_rows.popleft())
+                counters["evicted_rows"] += 1
+
+    parsed: list[dict[str, Any]] = []
+    for line in raw_rows:
+        try:
+            row = json.loads(line)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if isinstance(row, dict):
+            parsed.append(row)
+    counters["retained_rows"] = len(parsed)
+    counters["retained_bytes"] = retained_bytes
+    return parsed
+
+
+def tail_jsonl(
+    path: Path,
+    limit: int,
+    *,
+    max_bytes: int = JSONL_TAIL_MAX_BYTES,
+    max_line_bytes: int = JSONL_TAIL_MAX_LINE_BYTES,
+    stats: dict[str, int] | None = None,
+) -> list[dict[str, Any]]:
     try:
-        with path.open("r", encoding="utf-8", errors="replace") as handle:
-            for line in handle:
-                try:
-                    rows.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
+        with path.open("rb") as handle:
+            return _tail_jsonl_handles(
+                [handle],
+                limit=limit,
+                max_bytes=max_bytes,
+                max_line_bytes=max_line_bytes,
+                stats=stats,
+            )
     except FileNotFoundError:
         return []
-    return list(rows)
 
 
 def rotated_jsonl_paths(path: Path) -> list[Path]:
@@ -70,22 +126,53 @@ def rotated_jsonl_paths(path: Path) -> list[Path]:
     return paths
 
 
-def tail_jsonl_many(paths: Iterable[Path], limit: int) -> list[dict[str, Any]]:
-    rows: deque[dict[str, Any]] = deque(maxlen=max(1, limit))
+def tail_jsonl_many(
+    paths: Iterable[Path],
+    limit: int,
+    *,
+    max_bytes: int = JSONL_TAIL_MAX_BYTES,
+    max_line_bytes: int = JSONL_TAIL_MAX_LINE_BYTES,
+    stats: dict[str, int] | None = None,
+) -> list[dict[str, Any]]:
+    row_limit = min(JSONL_TAIL_MAX_ROWS, max(1, limit))
+    byte_limit = max(1, max_bytes)
+    line_limit = max(1, max_line_bytes)
+    raw_rows: deque[bytes] = deque()
+    retained_bytes = 0
+    counters = stats if stats is not None else {}
+    counters.setdefault("oversized_lines", 0)
+    counters.setdefault("evicted_rows", 0)
     for path in paths:
         try:
             opener = gzip.open if path.suffix == ".gz" else open
-            with opener(path, "rt", encoding="utf-8", errors="replace") as handle:
-                for line in handle:
-                    try:
-                        rows.append(json.loads(line))
-                    except json.JSONDecodeError:
+            with opener(path, "rb") as handle:
+                while True:
+                    line = handle.readline(line_limit + 1)
+                    if not line:
+                        break
+                    if len(line) > line_limit:
+                        counters["oversized_lines"] += 1
+                        while line and not line.endswith(b"\n"):
+                            line = handle.readline(line_limit + 1)
                         continue
-        except FileNotFoundError:
+                    raw_rows.append(line)
+                    retained_bytes += len(line)
+                    while len(raw_rows) > row_limit or retained_bytes > byte_limit:
+                        retained_bytes -= len(raw_rows.popleft())
+                        counters["evicted_rows"] += 1
+        except (FileNotFoundError, OSError):
             continue
-        except OSError:
+    parsed: list[dict[str, Any]] = []
+    for line in raw_rows:
+        try:
+            row = json.loads(line)
+        except (json.JSONDecodeError, UnicodeDecodeError):
             continue
-    return list(rows)
+        if isinstance(row, dict):
+            parsed.append(row)
+    counters["retained_rows"] = len(parsed)
+    counters["retained_bytes"] = retained_bytes
+    return parsed
 
 
 def tail_text(path: Path, limit: int) -> list[str]:

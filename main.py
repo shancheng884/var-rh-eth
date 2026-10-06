@@ -2904,6 +2904,7 @@ class VariationalToLighterRuntime:
         self.live_inventory_last_disk_entry_block_log_monotonic = 0.0
         self.live_inventory_lighter_eth_leverage_ready: bool | None = None
         self._last_live_inventory_exit_blocked_log: dict[tuple[Any, str], float] = {}
+        self._last_live_inventory_v4_exit_observation_log_monotonic = 0.0
         self._last_auto_live_precheck_failure_log: dict[tuple[str, int, str, str, str], float] = {}
         self.paper_last_closed_monotonic: float | None = None
         self.paper_opportunity_counter = 0
@@ -4364,6 +4365,71 @@ class VariationalToLighterRuntime:
             return False
         self._last_live_inventory_exit_blocked_log[key] = now
         return True
+
+    async def maybe_log_live_inventory_v4_exit_observation(
+        self, *, asset: str, sample_index: int, state_payload: dict[str, Any]
+    ) -> None:
+        if (
+            not getattr(self, "live_inventory_basis_v4_mode", False)
+            or getattr(self, "live_inventory_dry_decisions", False)
+        ):
+            return
+        now = time.monotonic()
+        last = float(
+            getattr(
+                self,
+                "_last_live_inventory_v4_exit_observation_log_monotonic",
+                0.0,
+            )
+            or 0.0
+        )
+        if now - last < 60.0:
+            return
+        lots = []
+        for lot in getattr(self, "live_inventory_open_lots", []):
+            if lot.get("entry_kind") != "basis_v4_eth_short_p97_5":
+                continue
+            match_count = to_decimal(
+                lot.get("executable_exit_mfe_observations")
+            ) or Decimal("0")
+            lots.append({
+                "lot_id": lot.get("lot_id"),
+                "direction": lot.get("direction"),
+                "entered_at": lot.get("entered_at"),
+                "entry_cost_status": lot.get("entry_cost_status"),
+                "last_matched_executable_pnl_bps": lot.get(
+                    "executable_exit_last_match_pnl_bps"
+                ),
+                "last_matched_at": lot.get(
+                    "executable_exit_last_match_at"
+                ),
+                "matched_quote_observations": max(0, int(match_count)),
+                "executable_mfe_pnl_bps": lot.get(
+                    "executable_exit_mfe_pnl_bps"
+                ),
+                "effective_exit_target_bps": lot.get(
+                    "executable_exit_last_target_bps"
+                ),
+            })
+        if not lots:
+            return
+        self._last_live_inventory_v4_exit_observation_log_monotonic = now
+        await self.append_live_inventory_log(
+            "live_inventory_v4_exit_observation",
+            {
+                "asset": asset,
+                "sample_index": sample_index,
+                "observed_at": utc_now(),
+                "var_quote_age_seconds": state_payload.get(
+                    "var_quote_age_seconds"
+                ),
+                "lighter_book_age_seconds": state_payload.get(
+                    "lighter_book_age_seconds"
+                ),
+                "open_lot_count": len(lots),
+                "lots": lots,
+            },
+        )
 
     def should_log_live_inventory_entry_blocked(self, *, direction: str, reason: str) -> bool:
         logs = getattr(self, "_last_live_inventory_entry_blocked_log", None)
@@ -22977,6 +23043,16 @@ class VariationalToLighterRuntime:
                     if prior_executable_mfe is None
                     else max(prior_executable_mfe, pnl_bps)
                 )
+                candidate_lot["executable_exit_last_match_pnl_bps"] = decimal_to_str(
+                    pnl_bps
+                )
+                candidate_lot["executable_exit_last_match_at"] = utc_now()
+                prior_observations = to_decimal(
+                    candidate_lot.get("executable_exit_mfe_observations")
+                ) or Decimal("0")
+                candidate_lot["executable_exit_mfe_observations"] = max(
+                    0, int(prior_observations)
+                ) + 1
             convergence_velocity_bps_per_minute: Decimal | None = None
             if pnl_bps is not None:
                 prior_pnl_bps = to_decimal(candidate_lot.get("shadow_last_pnl_bps"))
@@ -23090,6 +23166,9 @@ class VariationalToLighterRuntime:
                     )
                     if locked_portfolio_target is not None:
                         effective_min_exit_pnl_bps = locked_portfolio_target
+                candidate_lot["executable_exit_last_target_bps"] = decimal_to_str(
+                    effective_min_exit_pnl_bps
+                )
                 signal_reverted = False
                 signal_exit_watch_timeout = False
                 signal_exit_watch_timeout_ok = False
@@ -23313,6 +23392,11 @@ class VariationalToLighterRuntime:
                 selected_pnl_bps = selected_exit.get("pnl_bps") if selected_exit is not None else None
                 if selected_exit is None or (pnl_bps is not None and (selected_pnl_bps is None or pnl_bps > selected_pnl_bps)):
                     selected_exit = candidate_exit
+        await self.maybe_log_live_inventory_v4_exit_observation(
+            asset=asset,
+            sample_index=index,
+            state_payload=state_payload,
+        )
         if selected_exit is None:
             return
         lot_index = int(selected_exit["lot_index"])

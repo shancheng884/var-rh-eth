@@ -10,6 +10,7 @@ from collections import Counter, deque
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
+from statistics import median
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -22,6 +23,9 @@ from tools.lib.runtime_files import (  # noqa: E402
     LIVE_STATE,
     LOG_DIR,
     ORDER_METRICS,
+    JSONL_TAIL_MAX_BYTES,
+    JSONL_TAIL_MAX_LINE_BYTES,
+    JSONL_TAIL_MAX_ROWS,
     RUNTIME_LOG,
     avg,
     fmt_decimal,
@@ -36,6 +40,10 @@ from tools.lib.runtime_files import (  # noqa: E402
     to_decimal,
 )
 from tools.lib.basis_store import read_basis_samples  # noqa: E402
+
+
+MAX_ANALYZE_TAIL_ROWS = JSONL_TAIL_MAX_ROWS
+ANALYZE_SOURCE_MAX_BYTES = JSONL_TAIL_MAX_BYTES
 
 
 def bounded_diagnostic_line(line: str, max_chars: int = 500) -> str:
@@ -85,6 +93,260 @@ def latest_run_filter(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [row for row in rows if str(row.get("run_id") or "") == latest_run_id]
 
 
+def build_v4_entry_episode_summary(
+    state_rows: list[dict[str, Any]], *, max_gap_seconds: float = 90.0
+) -> dict[str, dict[str, dict[str, Any]]]:
+    directions = ("long_var_short_lighter", "short_var_long_lighter")
+    relaxations = (Decimal("0"), Decimal("1"), Decimal("2"))
+    active: dict[tuple[str, Decimal], dict[str, Any] | None] = {
+        (direction, relaxation): None
+        for direction in directions
+        for relaxation in relaxations
+    }
+    summary: dict[tuple[str, Decimal], dict[str, Any]] = {
+        key: {"samples": 0, "episodes": 0, "multi_sample_episodes": 0, "durations": []}
+        for key in active
+    }
+
+    def finish(key: tuple[str, Decimal]) -> None:
+        episode = active[key]
+        if episode is None:
+            return
+        stats = summary[key]
+        stats["episodes"] += 1
+        if episode["samples"] >= 2:
+            stats["multi_sample_episodes"] += 1
+        stats["durations"].append(max(0.0, episode["last_at"] - episode["first_at"]))
+        active[key] = None
+
+    unique_rows: dict[tuple[str, str], dict[str, Any]] = {}
+    without_sample_index: list[dict[str, Any]] = []
+    for row in state_rows:
+        run_id = str(row.get("run_id") or "")
+        sample_index = row.get("sample_index")
+        if not run_id or sample_index is None:
+            without_sample_index.append(row)
+            continue
+        key = (run_id, str(sample_index))
+        prior = unique_rows.get(key)
+        prefer_row = prior is None or (
+            row.get("sample_quality") == "valid"
+            and prior.get("sample_quality") != "valid"
+        ) or (
+            row.get("sample_pair_valid") is True
+            and prior.get("sample_pair_valid") is not True
+        )
+        if prefer_row:
+            unique_rows[key] = row
+    ordered_rows = [*unique_rows.values(), *without_sample_index]
+    for row in sorted(ordered_rows, key=lambda item: str(item.get("logged_at") or "")):
+        at = parse_time(row.get("logged_at"))
+        quality = str(row.get("sample_quality") or "legacy")
+        usable = (
+            at is not None
+            and row.get("sample_pair_valid") is not False
+            and quality in {"valid", "legacy"}
+        )
+        edges = row.get("v4_direction_edges_bps")
+        thresholds = row.get("v4_direction_thresholds_bps")
+        if not isinstance(edges, dict):
+            edges = {}
+        if not isinstance(thresholds, dict):
+            thresholds = {}
+        for direction in directions:
+            edge = to_decimal(edges.get(direction))
+            threshold = to_decimal(thresholds.get(direction))
+            if edge is None and row.get("v4_entry_direction") == direction:
+                edge = to_decimal(row.get("v4_signal_edge_bps"))
+                threshold = threshold or to_decimal(row.get("v4_entry_threshold_bps"))
+            timestamp = at.timestamp() if at is not None else None
+            for relaxation in relaxations:
+                key = (direction, relaxation)
+                qualifies = bool(
+                    usable
+                    and edge is not None
+                    and threshold is not None
+                    and edge >= threshold - relaxation
+                )
+                episode = active[key]
+                if (
+                    episode is not None
+                    and timestamp is not None
+                    and timestamp - episode["last_at"] > max_gap_seconds
+                ):
+                    finish(key)
+                    episode = None
+                if not qualifies or timestamp is None:
+                    finish(key)
+                    continue
+                if episode is None:
+                    active[key] = {
+                        "first_at": timestamp,
+                        "last_at": timestamp,
+                        "samples": 1,
+                    }
+                else:
+                    episode["last_at"] = timestamp
+                    episode["samples"] += 1
+                summary[key]["samples"] += 1
+    for key in active:
+        finish(key)
+
+    result: dict[str, dict[str, dict[str, Any]]] = {}
+    for (direction, relaxation), stats in summary.items():
+        durations = stats.pop("durations")
+        result.setdefault(direction, {})[str(relaxation)] = {
+            **stats,
+            "median_duration_seconds": median(durations) if durations else None,
+        }
+    return result
+
+
+def build_v4_exit_observation_summary(
+    rows: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    lots: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        event = row.get("event")
+        if event == "live_inventory_v4_exit_observation":
+            observations = row.get("lots")
+            if not isinstance(observations, list):
+                continue
+            items = observations
+        elif event == "live_inventory_exited":
+            items = [
+                {
+                    "lot_id": row.get("lot_id"),
+                    "direction": row.get("direction"),
+                    "executable_mfe_pnl_bps": row.get(
+                        "executable_exit_mfe_pnl_bps"
+                    ),
+                    "effective_exit_target_bps": row.get(
+                        "effective_min_exit_pnl_bps"
+                    ),
+                    "matched_quote_observations": None,
+                    "final_pnl_bps": row.get("pnl_bps"),
+                }
+            ]
+            exited_lot_id = row.get("lot_id")
+            if exited_lot_id is not None:
+                stats = lots.setdefault(
+                    str(exited_lot_id), {"lot_id": str(exited_lot_id)}
+                )
+                stats["exit_event_seen"] = True
+        elif event == "live_inventory_actual_pnl":
+            if row.get("actual_pnl_status") != "lighter_final_fill_confirmed":
+                continue
+            lot_id = row.get("lot_id")
+            if lot_id is None:
+                continue
+            stats = lots.setdefault(str(lot_id), {"lot_id": str(lot_id)})
+            stats["actual_pnl_bps"] = row.get("actual_pnl_bps")
+            stats["actual_pnl_usd"] = row.get("actual_pnl_usd")
+            stats["closed_child_lots"] = row.get("closed_child_lots")
+            stats["actual_pnl_confirmed_at"] = row.get("confirmed_at") or row.get(
+                "logged_at"
+            )
+            continue
+        else:
+            continue
+        for item in items:
+            if not isinstance(item, dict) or item.get("lot_id") is None:
+                continue
+            lot_id = str(item["lot_id"])
+            stats = lots.setdefault(lot_id, {"lot_id": lot_id})
+            mfe = to_decimal(item.get("executable_mfe_pnl_bps"))
+            prior = to_decimal(stats.get("observed_peak_bps"))
+            if mfe is not None and (prior is None or mfe > prior):
+                stats["observed_peak_bps"] = str(mfe)
+            for key in (
+                "direction",
+                "effective_exit_target_bps",
+                "matched_quote_observations",
+                "last_matched_at",
+            ):
+                if item.get(key) is not None:
+                    stats[key] = item[key]
+            stats["last_snapshot_at"] = row.get("observed_at") or row.get(
+                "logged_at"
+            )
+            if item.get("final_pnl_bps") is not None:
+                stats["final_pnl_bps"] = item["final_pnl_bps"]
+    return lots
+
+
+def build_v4_exit_target_sensitivity(
+    lots: dict[str, dict[str, Any]],
+    *,
+    candidate_targets_bps: tuple[Decimal, ...] = (
+        Decimal("3.5"),
+        Decimal("4.0"),
+        Decimal("4.5"),
+    ),
+) -> list[dict[str, Any]]:
+    observed_lots = [
+        stats
+        for stats in lots.values()
+        if to_decimal(stats.get("observed_peak_bps")) is not None
+    ]
+    results = []
+    for target in candidate_targets_bps:
+        crossed = [
+            stats
+            for stats in observed_lots
+            if to_decimal(stats.get("observed_peak_bps")) >= target
+        ]
+        closed_confirmed = [
+            stats
+            for stats in crossed
+            if to_decimal(stats.get("actual_pnl_bps")) is not None
+            and int(to_decimal(stats.get("closed_child_lots")) or 0) == 1
+        ]
+        exited = [stats for stats in crossed if stats.get("exit_event_seen")]
+        exited_without_confirmed_pnl = [
+            stats
+            for stats in exited
+            if to_decimal(stats.get("actual_pnl_bps")) is None
+        ]
+        confirmed_multi_lot_exits = [
+            stats
+            for stats in exited
+            if to_decimal(stats.get("actual_pnl_bps")) is not None
+            and int(to_decimal(stats.get("closed_child_lots")) or 0) != 1
+        ]
+        lower_than_recorded_target = [
+            stats
+            for stats in closed_confirmed
+            if (to_decimal(stats.get("effective_exit_target_bps")) or target)
+            > target
+        ]
+        actual_values = [
+            to_decimal(stats.get("actual_pnl_bps"))
+            for stats in closed_confirmed
+        ]
+        valid_actuals = [value for value in actual_values if value is not None]
+        results.append(
+            {
+                "target_bps": target,
+                "observed_lots": len(observed_lots),
+                "peak_crossed_lots": len(crossed),
+                "open_crossed_lots": len(crossed) - len(exited),
+                "exited_without_confirmed_pnl": len(exited_without_confirmed_pnl),
+                "confirmed_multi_lot_exits": len(confirmed_multi_lot_exits),
+                "confirmed_single_lot_closes_crossed": len(closed_confirmed),
+                "closed_crossed_below_recorded_target": len(
+                    lower_than_recorded_target
+                ),
+                "confirmed_actual_avg_pnl_bps": (
+                    sum(valid_actuals, Decimal("0")) / len(valid_actuals)
+                    if valid_actuals
+                    else None
+                ),
+            }
+        )
+    return results
+
+
 def build_v4_live_funnel(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
     v4_rows = [
         row
@@ -114,6 +376,7 @@ def build_v4_live_funnel(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
         threshold = to_decimal(row.get("v4_entry_threshold_bps"))
         if edge is not None and threshold is not None and edge > threshold:
             threshold_crossings += 1
+    entry_episode_summary = build_v4_entry_episode_summary(state_rows)
 
     events = Counter(str(row.get("event") or "-") for row in v4_rows)
     reasons = Counter(
@@ -128,6 +391,10 @@ def build_v4_live_funnel(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
     ]
     exit_block_reasons = Counter(
         str(row.get("reason") or "unknown") for row in exit_block_rows
+    )
+    exit_observation_summary = build_v4_exit_observation_summary(v4_rows)
+    exit_target_sensitivity = build_v4_exit_target_sensitivity(
+        exit_observation_summary
     )
     shadows = [
         row
@@ -375,6 +642,9 @@ def build_v4_live_funnel(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
         ),
         "samples": len(state_rows),
         "threshold_crossings": threshold_crossings,
+        "entry_episode_summary": entry_episode_summary,
+        "exit_observation_summary": exit_observation_summary,
+        "exit_target_sensitivity": exit_target_sensitivity,
         "large_move_blocks": reasons["basis_sample_move_too_large"],
         "refreshed_edge_blocks": reasons["basis_entry_refreshed_edge_below_threshold"],
         "exit_block_reasons": dict(exit_block_reasons),
@@ -799,6 +1069,60 @@ def print_v4_live_funnel(rows: list[dict[str, Any]]) -> None:
         f"large_move_blocks={funnel['large_move_blocks']} "
         f"refreshed_edge_blocks={funnel['refreshed_edge_blocks']}"
     )
+    print(
+        "entry_signal_episodes=threshold_relaxation_bps:current,1,2; "
+        "not executable fills; durations are observed within the selected tail"
+    )
+    for direction, offsets in funnel["entry_episode_summary"].items():
+        for offset, stats in offsets.items():
+            duration = stats["median_duration_seconds"]
+            duration_text = "-" if duration is None else f"{duration:.1f}"
+            print(
+                f"entry_episodes direction={direction} "
+                f"threshold_relaxation_bps={offset} samples={stats['samples']} "
+                f"episodes={stats['episodes']} "
+                f"episodes_2plus_samples={stats['multi_sample_episodes']} "
+                f"median_duration_seconds={duration_text}"
+            )
+    if funnel["exit_observation_summary"]:
+        print(
+            "exit_observed_peaks=matched_quote_depth_estimate_not_confirmed_fills; "
+            "per-sample MFE persisted about every 60s; funding excluded"
+        )
+        for result in funnel["exit_target_sensitivity"]:
+            avg_actual = result["confirmed_actual_avg_pnl_bps"]
+            avg_actual_text = "-" if avg_actual is None else f"{avg_actual:.3f}"
+            print(
+                f"exit_target_sensitivity target_bps={result['target_bps']} "
+                f"peak_crossed={result['peak_crossed_lots']}/"
+                f"{result['observed_lots']} "
+                f"open_crossed={result['open_crossed_lots']} "
+                f"exited_without_confirmed_pnl="
+                f"{result['exited_without_confirmed_pnl']} "
+                f"confirmed_multi_lot_exits="
+                f"{result['confirmed_multi_lot_exits']} "
+                f"confirmed_single_lot_closes_crossed="
+                f"{result['confirmed_single_lot_closes_crossed']} "
+                f"closed_crossed_below_recorded_target="
+                f"{result['closed_crossed_below_recorded_target']} "
+                f"those_closes_actual_avg_pnl_bps={avg_actual_text}"
+            )
+        ordered_lots = sorted(
+            funnel["exit_observation_summary"].items(),
+            key=lambda item: int(item[0]) if item[0].isdigit() else -1,
+        )
+        omitted = max(0, len(ordered_lots) - 25)
+        for lot_id, stats in ordered_lots[-25:]:
+            print(
+                f"exit_lot={lot_id} direction={stats.get('direction')} "
+                f"observed_peak_bps={stats.get('observed_peak_bps', '-')} "
+                f"target_bps={stats.get('effective_exit_target_bps', '-')} "
+                f"matched_samples={stats.get('matched_quote_observations', '-')} "
+                f"last_match_at={stats.get('last_matched_at', '-')} "
+                f"final_pnl_bps={stats.get('final_pnl_bps', '-')}"
+            )
+        if omitted:
+            print(f"exit_lots_omitted={omitted}")
     print(
         f"preflight_reached={funnel['preflight_reached']} "
         f"preflight_passed={funnel['preflight_passed']} "
@@ -3671,7 +3995,15 @@ def parse_positive_int_list(value: str, *, label: str) -> tuple[int, ...]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Analyze real live trading logs.")
-    parser.add_argument("--tail", type=int, default=50000, help="JSONL rows to inspect from order_metrics.jsonl. Default: 50000.")
+    parser.add_argument(
+        "--tail",
+        type=int,
+        default=5000,
+        help=(
+            "Maximum merged JSONL rows to inspect (hard cap 10000; each source "
+            "also has a 2 MiB retained-byte limit). Default: 5000."
+        ),
+    )
     parser.add_argument("--include-rotated", action="store_true", help="Include rotated order_metrics.jsonl.N and .gz files.")
     parser.add_argument("--all-runs", action="store_true", help="Analyze all tailed rows instead of only the latest run_id.")
     parser.add_argument(
@@ -3763,6 +4095,11 @@ def main() -> int:
     args = parser.parse_args()
     if args.tail <= 0:
         parser.error("--tail must be > 0")
+    if args.tail > MAX_ANALYZE_TAIL_ROWS:
+        parser.error(
+            f"--tail must be <= {MAX_ANALYZE_TAIL_ROWS}; "
+            "use a smaller tail and filter by --asset for bounded analysis"
+        )
     if args.top <= 0:
         parser.error("--top must be > 0")
     if args.ladder_max_lots <= 0:
@@ -3856,8 +4193,33 @@ def main() -> int:
         parser.error("basis V3 intervals, history, hold, and sample counts must be positive; cooldown may be 0")
 
     source_paths = rotated_jsonl_paths(ORDER_METRICS) if args.include_rotated else [ORDER_METRICS]
-    legacy_rows = tail_jsonl_many(source_paths, args.tail) if args.include_rotated else tail_jsonl(ORDER_METRICS, args.tail)
-    collector_rows = read_basis_samples(BASIS_SAMPLES_DIR, limit=args.tail, asset_filter=args.asset)
+    metrics_tail_stats: dict[str, int] = {}
+    basis_tail_stats: dict[str, int] = {}
+    if args.include_rotated:
+        legacy_rows = tail_jsonl_many(
+            source_paths,
+            args.tail,
+            max_bytes=ANALYZE_SOURCE_MAX_BYTES,
+            max_line_bytes=JSONL_TAIL_MAX_LINE_BYTES,
+            stats=metrics_tail_stats,
+        )
+    else:
+        legacy_rows = tail_jsonl(
+            ORDER_METRICS,
+            args.tail,
+            max_bytes=ANALYZE_SOURCE_MAX_BYTES,
+            max_line_bytes=JSONL_TAIL_MAX_LINE_BYTES,
+            stats=metrics_tail_stats,
+        )
+    collector_rows = read_basis_samples(
+        BASIS_SAMPLES_DIR,
+        limit=args.tail,
+        asset_filter=args.asset,
+        max_total_rows=args.tail,
+        max_total_bytes=ANALYZE_SOURCE_MAX_BYTES,
+        max_line_bytes=JSONL_TAIL_MAX_LINE_BYTES,
+        stats=basis_tail_stats,
+    )
     merged_rows = _deduplicate_sample_rows([*legacy_rows, *collector_rows])
     if data_cutoff is not None:
         merged_rows = [
@@ -3975,6 +4337,19 @@ def main() -> int:
             f"disk_free_gb={collector_health.get('disk_free_gb')} extension_failures={collector_health.get('extension_consecutive_failures')}"
         )
     print(f"rows={len(rows)}/{len(raw_rows)} latest_at={latest_at} latest_age={age}")
+    print(
+        "analysis_input_bounds="
+        f"requested_rows={args.tail} max_rows={MAX_ANALYZE_TAIL_ROWS} "
+        f"metrics_retained_rows={metrics_tail_stats.get('retained_rows', 0)} "
+        f"metrics_retained_bytes={metrics_tail_stats.get('retained_bytes', 0)} "
+        f"metrics_evicted_rows={metrics_tail_stats.get('evicted_rows', 0)} "
+        f"metrics_oversized_lines={metrics_tail_stats.get('oversized_lines', 0)} "
+        f"basis_retained_rows={len(collector_rows)} "
+        f"basis_retained_bytes={basis_tail_stats.get('retained_bytes', 0)} "
+        f"basis_evicted_rows={basis_tail_stats.get('evicted_rows', 0)} "
+        f"basis_oversized_lines={basis_tail_stats.get('oversized_lines', 0)} "
+        f"basis_byte_limit={ANALYZE_SOURCE_MAX_BYTES}"
+    )
 
     print("== events ==")
     print(
