@@ -512,3 +512,58 @@ The independent Pushover Emergency and Tencent Cloud voice escalation service
 is documented in `docs/risk_wakeup_watchdog.md`. It reads local state and the
 main runtime's small risk heartbeat only; it never enters the quote or order
 path.
+
+# Realized Var/RH PnL
+
+The realized report counts every executed ETH fill on both platforms and sums
+executed notional on both venues. Total PnL includes only realized close PnL
+and settled funding, excludes unrealized PnL on open positions, and deducts
+confirmed fees if present. Deposits and withdrawals are shown separately and
+adjust the capital denominator; they are not profit. The initial reporting
+capital is USD 241.774564 from 2026-10-05.
+
+RH history is fetched through read-only Lighter history APIs. Variational
+history must be exported from the account UI: download the ETH trades CSV and
+the transfers CSV containing realized PnL, funding, fees, deposits, and
+withdrawals. Keep them private under `log/platform_pnl_imports/`; `log/` and
+CSV files are ignored by Git. Use filenames containing `trade` and
+`transfer` (or `fund`) respectively. If an export reaches 10,000 rows, split
+the requested history into smaller time ranges before importing.
+
+CSV presence and freshness do not prove date coverage. After checking that the
+files cover every ETH trade and money movement from the statistics start
+through the requested report end, create the local coverage attestation:
+
+```bash
+python tools/confirm_var_export_coverage.py \
+  --complete-from 2026-10-05 \
+  --complete-through 2026-10-06 \
+  --i-confirm-complete
+```
+
+The attestation binds its interval to SHA-256 hashes of the CSVs. Editing or
+replacing an export invalidates it. Only confirm after verifying the full
+history in Variational; without confirmation, the report stays partial. The
+report also checks export freshness, row limits, parse quality, RH pagination,
+and whether the attested interval covers the requested period.
+
+Preview or send a Beijing-day report. The installed systemd timer requests the
+prior Beijing day and synchronizes RH history:
+
+```bash
+python tools/daily_pnl_report.py --asset ETH --day 2026-10-06 \
+  --sync-platform-data --dry-run
+python tools/daily_pnl_report.py --asset ETH --day 2026-10-06 \
+  --sync-platform-data --force
+```
+
+Query an arbitrary inclusive Beijing date range with the same definition:
+
+```bash
+python tools/platform_pnl_report.py --start 2026-10-05 --end 2026-10-06
+```
+
+Use `--no-sync` only when intentionally querying the last saved RH snapshot.
+Until both sources and the Var coverage attestation are complete, known
+subtotals are labeled partial and annualized return is withheld rather than
+presenting missing history as zero.

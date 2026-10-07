@@ -253,6 +253,55 @@ def format_telegram_trade_message(
             ]
         )
     if event_type == "live_inventory_pnl_summary":
+        if payload.get("summary_scope") == "realized_platform_activity":
+            status = "完整" if payload.get("summary_status") == "complete" else "部分时段"
+            lines = [
+                "[Var/RH] 北京时间每日收益",
+                f"日期：{_value(payload, 'beijing_day')}｜资产：{asset}｜状态：{status}",
+                f"双平台成交笔数：{_value(payload, 'daily_trade_count')} 笔（开仓、平仓均计）",
+                "双平台总成交量："
+                f"{_localized_money(payload, 'daily_volume_usd')}",
+                "当日平仓收益："
+                f"{_localized_money(payload, 'daily_realized_pnl_usd')}",
+                "当日资金费："
+                f"{_localized_money(payload, 'daily_funding_usd')}",
+                "当日双平台总盈亏："
+                f"{_localized_money(payload, 'daily_net_pnl_usd')}",
+                f"累计双平台总成交量：{_localized_money(payload, 'cumulative_volume_usd')}",
+                f"累计平仓收益：{_localized_money(payload, 'cumulative_realized_pnl_usd')}",
+                f"累计资金费：{_localized_money(payload, 'cumulative_funding_usd')}",
+                f"累计双平台总盈亏：{_localized_money(payload, 'cumulative_net_pnl_usd')}",
+                f"累计简单年化：{_localized_percent(payload, 'annualized_simple_pct')}",
+                f"统计起始日：{_value(payload, 'statistics_start_day')}",
+                f"统计本金（按净充提调整）：{_localized_money(payload, 'capital_usd')}",
+                f"期初本金：{_localized_money(payload, 'initial_capital_usd')}",
+                f"统计期间净充提：{_localized_money(payload, 'external_cashflow_usd')}",
+                f"最新双边权益：{_localized_money(payload, 'combined_equity_usd')}",
+                f"Variational 权益：{_localized_money(payload, 'variational_equity_usd')}",
+                f"RH 权益：{_localized_money(payload, 'lighter_equity_usd')}",
+                f"权益快照：{_value(payload, 'account_snapshot_at')}",
+                "口径：两边平台已实现平仓盈亏＋已结算资金费；手续费按当前0计；未平仓浮动盈亏不计",
+                "说明：手动成交计入；充值提现单独记账并调整统计本金",
+            ]
+            if status != "完整":
+                detail = payload.get("source_detail") or {}
+                reason_labels = {
+                    "variational_export_missing_or_incomplete": "Variational历史CSV缺失或解析不完整",
+                    "variational_export_stale_or_timestamp_missing": "Variational导出超过30小时或时间缺失",
+                    "variational_export_may_be_truncated": "Variational导出可能达到10000行上限",
+                    "variational_coverage_not_confirmed_or_export_changed": "Variational导出覆盖范围未确认或文件有变化",
+                    "variational_coverage_does_not_cover_report_period": "Variational导出未覆盖统计区间",
+                    "variational_rows_unclassified": "存在未识别的Variational流水",
+                    "rh_history_sync_or_pagination_incomplete": "RH历史同步或分页不完整",
+                    "rh_rows_unclassified": "存在未识别的RH流水",
+                    "rh_nonzero_fees_need_currency_normalization": "RH发现非零手续费，尚未完成币种换算",
+                }
+                reasons = [
+                    reason_labels.get(str(reason), str(reason))
+                    for reason in detail.get("reasons", [])
+                ]
+                lines.append("数据未完整原因：" + ("；".join(reasons) or "来源检查未通过"))
+            return "\n".join(lines)
         if payload.get("summary_scope") == "account_equity_daily":
             status = {
                 "complete": "完整日",

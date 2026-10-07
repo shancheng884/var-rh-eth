@@ -33,6 +33,15 @@ from tools.lib.account_equity_ledger import (  # noqa: E402
     read_fresh_account_equity,
     record_account_equity_sample,
 )
+from tools.lib.platform_pnl import (  # noqa: E402
+    DEFAULT_LEDGER_PATH as DEFAULT_PLATFORM_LEDGER,
+    DEFAULT_START as DEFAULT_PLATFORM_START,
+    aggregate_period,
+    load_platform_ledger,
+    platform_source_completeness,
+    sync_platform_ledger,
+    weighted_capital,
+)
 from tools.lib.telegram_notifier import (  # noqa: E402
     TelegramNotifier,
     format_telegram_trade_message,
@@ -43,6 +52,66 @@ DEFAULT_BASELINE = ROOT / "log" / PNL_BASELINE_FILE_NAME
 DEFAULT_SEND_STATE = ROOT / "log" / "pnl_daily_telegram_state.json"
 DEFAULT_EQUITY_STATE = ROOT / "log" / "account_equity_daily_state.json"
 DEFAULT_RISK_HEALTH = ROOT / "log" / "live_inventory_risk_health.json"
+
+
+def build_platform_activity_payload(
+    ledger: dict[str, Any],
+    *,
+    asset: str,
+    day: date,
+    equity_state: dict[str, Any],
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    current = now or datetime.now(timezone.utc)
+    start = datetime.combine(day, datetime.min.time(), tzinfo=BEIJING_TIMEZONE)
+    next_midnight = datetime.combine(day + timedelta(days=1), datetime.min.time(), tzinfo=BEIJING_TIMEZONE)
+    start_utc = start.astimezone(timezone.utc)
+    end = min(current.astimezone(timezone.utc), next_midnight.astimezone(timezone.utc))
+    if end <= start_utc:
+        raise ValueError("cannot report a future Beijing date")
+    daily = aggregate_period(ledger, start_utc, end)
+    statistics_start = parse_timestamp(ledger.get("statistics_start") or DEFAULT_PLATFORM_START)
+    if statistics_start is None:
+        raise RuntimeError("platform PnL statistics start is invalid")
+    cumulative = aggregate_period(ledger, statistics_start, end)
+    average_capital, current_capital = weighted_capital(ledger, statistics_start, end)
+    elapsed_days = Decimal(str((end - statistics_start).total_seconds())) / Decimal("86400")
+    annualized = (
+        cumulative["net_pnl_usd"] / average_capital * Decimal("100") * Decimal("365") / elapsed_days
+        if average_capital > 0 and elapsed_days > 0 else None
+    )
+
+    complete, source_detail = platform_source_completeness(
+        ledger, now=current, required_through=end
+    )
+
+    return {
+        "summary_scope": "realized_platform_activity",
+        "summary_status": "complete" if complete else "partial",
+        "asset": asset.upper(),
+        "beijing_day": day.isoformat(),
+        "daily_trade_count": daily["trade_count"],
+        "daily_volume_usd": str(daily["volume_usd"]),
+        "daily_realized_pnl_usd": str(daily["realized_pnl_usd"]),
+        "daily_funding_usd": str(daily["funding_usd"]),
+        "daily_net_pnl_usd": str(daily["net_pnl_usd"]),
+        "cumulative_trade_count": cumulative["trade_count"],
+        "cumulative_volume_usd": str(cumulative["volume_usd"]),
+        "cumulative_realized_pnl_usd": str(cumulative["realized_pnl_usd"]),
+        "cumulative_funding_usd": str(cumulative["funding_usd"]),
+        "cumulative_net_pnl_usd": str(cumulative["net_pnl_usd"]),
+        "annualized_simple_pct": str(annualized) if complete and annualized is not None else None,
+        "statistics_start_day": statistics_start.astimezone(BEIJING_TIMEZONE).date().isoformat(),
+        "capital_usd": str(current_capital),
+        "initial_capital_usd": str(ledger.get("starting_capital_usd") or "241.774564"),
+        "variational_equity_usd": equity_state.get("latest_variational_equity_usd"),
+        "lighter_equity_usd": equity_state.get("latest_lighter_equity_usd"),
+        "combined_equity_usd": equity_state.get("latest_combined_equity_usd"),
+        "account_snapshot_at": equity_state.get("last_sample_at"),
+        "external_cashflow_usd": str(cumulative["cashflow_usd"]),
+        "source_status": "complete" if complete else "partial",
+        "source_detail": source_detail,
+    }
 
 
 def decimal_value(value: Any) -> Decimal | None:
@@ -348,6 +417,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--state-path", type=Path, default=DEFAULT_SEND_STATE)
     parser.add_argument("--equity-state-path", type=Path, default=DEFAULT_EQUITY_STATE)
     parser.add_argument("--risk-health-path", type=Path, default=DEFAULT_RISK_HEALTH)
+    parser.add_argument("--platform-ledger-path", type=Path, default=DEFAULT_PLATFORM_LEDGER)
+    parser.add_argument("--sync-platform-data", action="store_true")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--attempts", type=int, default=3)
@@ -358,13 +429,13 @@ def main() -> int:
     args = build_parser().parse_args()
     load_dotenv(ROOT / ".env")
     baseline = load_pnl_baseline(args.baseline_path)
-    if baseline is None:
+    if baseline is None and not args.platform_ledger_path.exists() and not args.sync_platform_data:
         print("daily_pnl=SKIP baseline_missing")
         return 0
-    if str(baseline.get("asset") or "").upper() not in {"", args.asset.upper()}:
+    if baseline is not None and str(baseline.get("asset") or "").upper() not in {"", args.asset.upper()}:
         raise SystemExit("daily_pnl=FAILED baseline_asset_mismatch")
     equity_state = load_account_equity_state(args.equity_state_path)
-    if baseline.get("return_basis") == "account_equity_delta" and not args.dry_run:
+    if baseline is not None and baseline.get("return_basis") == "account_equity_delta" and not args.dry_run:
         sample, sample_reason = read_fresh_account_equity(
             args.risk_health_path,
             asset=args.asset,
@@ -377,13 +448,26 @@ def main() -> int:
             print(f"account_equity_sample=RECORDED at={sample['captured_at']}")
         else:
             print(f"account_equity_sample=SKIPPED reason={sample_reason}")
+    if args.sync_platform_data:
+        try:
+            sync_platform_ledger(path=args.platform_ledger_path)
+            print("platform_pnl_sync=PASS")
+        except Exception as exc:
+            print(f"platform_pnl_sync=FAILED reason={type(exc).__name__}:{exc}")
+            return 1
     target_day = resolve_day(args.day)
     started_day = date.fromisoformat(
-        str(baseline.get("current_beijing_day") or target_day.isoformat())
+        str((baseline or {}).get("current_beijing_day") or target_day.isoformat())
     )
-    baseline_started = parse_timestamp(baseline.get("started_at"))
-    if baseline_started is not None:
-        started_day = baseline_started.astimezone(BEIJING_TIMEZONE).date()
+    if args.platform_ledger_path.exists():
+        platform_ledger = load_platform_ledger(args.platform_ledger_path)
+        platform_started = parse_timestamp(platform_ledger.get("statistics_start"))
+        if platform_started is not None:
+            started_day = platform_started.astimezone(BEIJING_TIMEZONE).date()
+    else:
+        baseline_started = parse_timestamp((baseline or {}).get("started_at"))
+        if baseline_started is not None:
+            started_day = baseline_started.astimezone(BEIJING_TIMEZONE).date()
     if target_day < started_day:
         print("daily_pnl=SKIP target_before_baseline")
         return 0
@@ -407,12 +491,23 @@ def main() -> int:
         print(f"daily_pnl=SKIP already_sent key={send_key}")
         return 0
 
-    payload = build_daily_payload(
-        baseline,
-        asset=args.asset,
-        day=target_day,
-        equity_state=equity_state,
-    )
+    if args.platform_ledger_path.exists():
+        payload = build_platform_activity_payload(
+            load_platform_ledger(args.platform_ledger_path),
+            asset=args.asset,
+            day=target_day,
+            equity_state=equity_state,
+        )
+    else:
+        if baseline is None:
+            print("daily_pnl=SKIP baseline_and_platform_ledger_missing")
+            return 0
+        payload = build_daily_payload(
+            baseline,
+            asset=args.asset,
+            day=target_day,
+            equity_state=equity_state,
+        )
     message = format_telegram_trade_message(
         "live_inventory_pnl_summary",
         payload,
