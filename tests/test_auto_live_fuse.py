@@ -1227,6 +1227,8 @@ def test_account_risk_refreshes_stale_variational_snapshot_via_api() -> None:
         assert context["variational_portfolio_refresh_attempted"] is True
         assert context["variational_portfolio_refresh_ok"] is True
         assert context["variational_portfolio_refresh_reason"] == "api_fallback"
+        assert context["variational_portfolio_refresh_equity_usd"] == "102"
+        json.dumps(context)
 
     asyncio.run(run())
 

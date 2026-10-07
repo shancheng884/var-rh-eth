@@ -5969,7 +5969,7 @@ class VariationalToLighterRuntime:
                             variational_freshness["age_seconds"]
                         ),
                         "variational_portfolio_refresh_equity_usd": (
-                            variational_metrics.get("equity_usd")
+                            decimal_to_str(variational_metrics.get("equity_usd"))
                         ),
                     }
                 )

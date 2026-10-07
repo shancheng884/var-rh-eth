@@ -4337,6 +4337,20 @@ def main() -> int:
             f"disk_free_gb={collector_health.get('disk_free_gb')} extension_failures={collector_health.get('extension_consecutive_failures')}"
         )
     print(f"rows={len(rows)}/{len(raw_rows)} latest_at={latest_at} latest_age={age}")
+    analysis_truncated = bool(
+        metrics_tail_stats.get("evicted_rows", 0)
+        or basis_tail_stats.get("evicted_rows", 0)
+        or metrics_tail_stats.get("oversized_lines", 0)
+        or basis_tail_stats.get("oversized_lines", 0)
+    )
+    print(
+        "analysis_coverage="
+        f"first_at={raw_rows[0].get('logged_at') if raw_rows else '-'} "
+        f"last_at={raw_rows[-1].get('logged_at') if raw_rows else '-'} "
+        f"truncated={analysis_truncated} "
+        "historical_counts_incomplete="
+        f"{analysis_truncated}; use tools/profitability_audit.py for a full window"
+    )
     print(
         "analysis_input_bounds="
         f"requested_rows={args.tail} max_rows={MAX_ANALYZE_TAIL_ROWS} "
