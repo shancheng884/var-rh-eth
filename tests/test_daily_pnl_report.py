@@ -105,6 +105,42 @@ def test_account_equity_payload_keeps_fill_ledger_as_separate_stats() -> None:
     assert payload["cumulative_four_leg_volume_usd"] == "557.93743"
 
 
+def test_account_equity_payload_prefers_newer_flat_snapshot_over_stale_state() -> None:
+    baseline = new_pnl_baseline(
+        asset="ETH",
+        realized_pnl_usd="0",
+        completed_cycles=0,
+        started_at="2026-09-26T10:53:31+00:00",
+    )
+    baseline.update(
+        {
+            "return_basis": "account_equity_delta",
+            "account_baseline_equity_usd": "241.774564",
+            "account_baseline_at": "2026-09-26T11:11:38+00:00",
+            "latest_variational_equity_usd": "137.451292",
+            "latest_lighter_equity_usd": "104.447017",
+            "latest_combined_equity_usd": "241.898309",
+            "latest_account_snapshot_at": "2026-10-07T16:04:19.687018+00:00",
+        }
+    )
+    payload = build_daily_payload(
+        baseline,
+        asset="ETH",
+        day=date(2026, 10, 8),
+        equity_state={
+            "latest_variational_equity_usd": "141.3463973042380864",
+            "latest_lighter_equity_usd": "104.387816",
+            "latest_combined_equity_usd": "245.7342133042380764",
+            "last_sample_at": "2026-10-07T16:03:16.465490+00:00",
+            "daily_history": {},
+        },
+    )
+    assert payload["variational_equity_usd"] == "137.451292"
+    assert payload["lighter_equity_usd"] == "104.447017"
+    assert payload["combined_equity_usd"] == "241.898309"
+    assert payload["account_snapshot_at"] == "2026-10-07T16:04:19.687018+00:00"
+
+
 def test_account_equity_payload_uses_sep_26_capital_not_partial_day_change() -> None:
     baseline = new_pnl_baseline(
         asset="ETH",

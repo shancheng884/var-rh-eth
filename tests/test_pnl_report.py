@@ -31,7 +31,7 @@ from tools.lib.pnl_baseline import (
 )
 
 
-def test_extract_variational_account_metrics_adds_upnl() -> None:
+def test_extract_variational_account_metrics_does_not_double_count_upnl() -> None:
     metrics = extract_variational_account_metrics(
         {
             "pool_portfolio_result": {
@@ -43,8 +43,15 @@ def test_extract_variational_account_metrics_adds_upnl() -> None:
 
     assert metrics["balance_usd"] == Decimal("14.80")
     assert metrics["upnl_usd"] == Decimal("0.05")
-    assert metrics["equity_usd"] == Decimal("14.85")
-    assert metrics["equity_formula"] == "balance_plus_upnl"
+    assert metrics["equity_usd"] == Decimal("14.80")
+    assert metrics["equity_formula"] == "balance_includes_upnl"
+
+
+def test_variational_equity_matches_observed_flat_account_snapshot() -> None:
+    metrics = extract_variational_account_metrics(
+        {"pool_portfolio_result": {"balance": "137.451292", "upnl": "0"}}
+    )
+    assert metrics["equity_usd"] == Decimal("137.451292")
 
 
 def test_extract_lighter_account_metrics_uses_total_asset_value() -> None:
@@ -712,9 +719,9 @@ def test_account_snapshot_logs_normalized_equity_without_raw_account(
         row = json.loads(runtime.orders_file.read_text(encoding="utf-8"))
         assert row["snapshot_status"] == "complete"
         assert row["variational_snapshot_fresh"] is True
-        assert row["variational_equity_usd"] == "14.85"
+        assert row["variational_equity_usd"] == "14.80"
         assert row["lighter_equity_usd"] == "20.25"
-        assert row["combined_equity_usd"] == "35.10"
+        assert row["combined_equity_usd"] == "35.05"
         assert "must-not-be-logged" not in json.dumps(row)
 
     asyncio.run(run())

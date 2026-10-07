@@ -284,15 +284,34 @@ def build_account_equity_payload(
         else None
     )
     complete_day = complete_beijing_equity_day(record, day.isoformat())
+    equity_state_at = parse_timestamp(equity_state.get("last_sample_at"))
+    baseline_at = parse_timestamp(baseline.get("latest_account_snapshot_at"))
+    state_total = decimal_value(equity_state.get("latest_combined_equity_usd"))
+    baseline_total = decimal_value(baseline.get("latest_combined_equity_usd"))
+    use_baseline_snapshot = baseline_total is not None and (
+        baseline_at is not None
+        and (equity_state_at is None or baseline_at > equity_state_at)
+    )
+    if use_baseline_snapshot:
+        latest_total = baseline_total
+        current_sample_at = baseline_at
+        latest_variational = baseline.get("latest_variational_equity_usd")
+        latest_lighter = baseline.get("latest_lighter_equity_usd")
+    else:
+        latest_total = state_total if state_total is not None else baseline_total
+        current_sample_at = equity_state_at or baseline_at
+        latest_variational = (
+            equity_state.get("latest_variational_equity_usd")
+            or baseline.get("latest_variational_equity_usd")
+        )
+        latest_lighter = (
+            equity_state.get("latest_lighter_equity_usd")
+            or baseline.get("latest_lighter_equity_usd")
+        )
     observed = (
         now
-        or parse_timestamp(
-            equity_state.get("last_sample_at") or baseline.get("latest_account_snapshot_at")
-        )
+        or current_sample_at
         or datetime.now(timezone.utc)
-    )
-    current_sample_at = parse_timestamp(
-        equity_state.get("last_sample_at") or baseline.get("latest_account_snapshot_at")
     )
     daily_period_start = datetime.combine(
         day, datetime.min.time(), tzinfo=BEIJING_TIMEZONE
@@ -308,9 +327,6 @@ def build_account_equity_payload(
         if complete_day and observed_period_change is not None and daily_cashflow is not None
         else None
     )
-    latest_total = decimal_value(equity_state.get("latest_combined_equity_usd"))
-    if latest_total is None:
-        latest_total = decimal_value(baseline.get("latest_combined_equity_usd"))
     cumulative_cashflow = (
         _registered_cashflow_between(baseline, tracking_started_at, current_sample_at)
         if tracking_started_at is not None and current_sample_at is not None
@@ -409,10 +425,10 @@ def build_account_equity_payload(
         "external_cashflow_usd": str(cumulative_cashflow) if cumulative_cashflow is not None else None,
         "capital_usd": str(adjusted_capital) if adjusted_capital is not None else None,
         "capital_source": "first_statistics_day_equity_sample" if capital is not None else "unavailable",
-        "variational_equity_usd": equity_state.get("latest_variational_equity_usd") or baseline.get("latest_variational_equity_usd"),
-        "lighter_equity_usd": equity_state.get("latest_lighter_equity_usd") or baseline.get("latest_lighter_equity_usd"),
+        "variational_equity_usd": latest_variational,
+        "lighter_equity_usd": latest_lighter,
         "combined_equity_usd": str(latest_total) if latest_total is not None else None,
-        "account_snapshot_at": equity_state.get("last_sample_at") or baseline.get("latest_account_snapshot_at"),
+        "account_snapshot_at": current_sample_at.isoformat() if current_sample_at else None,
         "return_pnl_source": "account_equity_delta",
         "annualized_reliability": "account_equity_observation_period",
     }

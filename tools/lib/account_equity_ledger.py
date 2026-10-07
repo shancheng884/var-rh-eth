@@ -12,6 +12,7 @@ from tools.lib.pnl_baseline import BEIJING_TIMEZONE, beijing_day, parse_timestam
 RISK_HEALTH_MAX_AGE_SECONDS = 60
 DAILY_EQUITY_STATE_SCHEMA = 2
 MAX_DAILY_SAMPLE_GAP_SECONDS = 900
+VAR_EQUITY_FORMULA_VERSION = "balance_includes_upnl_v1"
 
 
 def _decimal(value: Any) -> Decimal | None:
@@ -67,6 +68,8 @@ def read_fresh_account_equity(
         return None, "variational_equity_stale"
     if health.get("variational_account_snapshot_usable") is not True:
         return None, "variational_equity_unusable"
+    if health.get("variational_equity_formula") != "balance_includes_upnl":
+        return None, "variational_equity_formula_unverified"
     if health.get("lighter_risk_fetch_error"):
         return None, "lighter_equity_fetch_failed"
     try:
@@ -93,6 +96,7 @@ def read_fresh_account_equity(
             "variational_equity_usd": str(variational),
             "lighter_equity_usd": str(lighter),
             "combined_equity_usd": str(combined),
+            "variational_equity_formula_version": VAR_EQUITY_FORMULA_VERSION,
         },
         "ok",
     )
@@ -132,9 +136,14 @@ def record_account_equity_sample(
     day = beijing_day(observed)
     if day is None:
         return state
+    formula_version = sample.get("variational_equity_formula_version")
+    if formula_version != VAR_EQUITY_FORMULA_VERSION:
+        return state
 
     history = dict(state.get("daily_history") or {})
     record = dict(history.get(day) or {})
+    if record.get("variational_equity_formula_version") != formula_version:
+        record = {}
     first_at = parse_timestamp(record.get("first_sample_at"))
     latest_at = parse_timestamp(record.get("latest_sample_at"))
     max_gap = (
@@ -157,6 +166,7 @@ def record_account_equity_sample(
             "latest_sample_at": latest_at.isoformat(),
             "sample_count": int(record.get("sample_count") or 0) + 1,
             "max_sample_gap_seconds": str(max_gap) if max_gap is not None else None,
+            "variational_equity_formula_version": formula_version,
         }
     )
     record["coverage_complete"] = complete_beijing_equity_day(record, day)
@@ -170,6 +180,7 @@ def record_account_equity_sample(
             "latest_variational_equity_usd": sample["variational_equity_usd"],
             "latest_lighter_equity_usd": sample["lighter_equity_usd"],
             "latest_combined_equity_usd": sample["combined_equity_usd"],
+            "variational_equity_formula_version": formula_version,
             "daily_history": dict(sorted(history.items())[-400:]),
         }
     )

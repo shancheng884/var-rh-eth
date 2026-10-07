@@ -698,6 +698,15 @@ def account_risk_context(
         "current_notional_usd": decimal_to_str(current_notional_usd),
         "proposed_notional_usd": decimal_to_str(proposed_notional_usd),
         "variational_equity_usd": decimal_to_str(var_equity),
+        "variational_balance_usd": decimal_to_str(
+            variational_metrics.get("balance_usd")
+        ),
+        "variational_upnl_usd": decimal_to_str(
+            variational_metrics.get("upnl_usd")
+        ),
+        "variational_equity_formula": variational_metrics.get(
+            "equity_formula"
+        ),
         "lighter_equity_usd": decimal_to_str(lighter_equity),
         "combined_equity_usd": decimal_to_str(
             var_equity + lighter_equity
@@ -1392,15 +1401,10 @@ def extract_variational_account_metrics(payload: Any) -> dict[str, Decimal | str
         payload = pool
     balance = to_decimal(payload.get("balance"))
     upnl = to_decimal(payload.get("upnl"))
-    if balance is None:
-        equity = None
-        formula = None
-    elif upnl is None:
-        equity = balance
-        formula = "balance"
-    else:
-        equity = balance + upnl
-        formula = "balance_plus_upnl"
+    # This portfolio endpoint's balance already includes mark-to-market PnL.
+    # Keep upnl as a diagnostic component; adding it would count it twice.
+    equity = balance
+    formula = "balance_includes_upnl" if balance is not None else None
     margin_usage = payload.get("margin_usage")
     if not isinstance(margin_usage, dict):
         margin_usage = {}
