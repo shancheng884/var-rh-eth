@@ -50,6 +50,20 @@ python tools/analyze.py
 
 This reads `log/order_metrics.jsonl`, `log/runtime.log`, and `log/live_inventory_state.json`. It does not start live, stop live, submit orders, or modify state.
 
+For a read-only V4 exit execution audit from a Beijing calendar day:
+
+```bash
+python tools/exit_execution_audit.py --asset ETH --since-beijing 2026-10-05
+```
+
+The audit joins confirmed close records by run and lot, separates adverse Var
+and RH exit-price drift, and counts logged quote-refresh blocks. Its
+`shadow_price_ceiling` lines only show how often a recorded refreshed executable
+price reached a hypothetical target. They do not replay confirmation, order
+submission, fills, fees, or funding, and must not be treated as missed profits.
+Fewer than 20 confirmed close groups triggers a low-sample warning. The tool
+does not change live strategy settings or account state.
+
 ## Profit And Account Equity Report
 
 The live process records a non-blocking account snapshot at startup and two
