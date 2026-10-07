@@ -268,7 +268,13 @@ def build_account_equity_payload(
     history = equity_state.get("daily_history") or {}
     record = history.get(day.isoformat()) or {}
     fill_record = pnl_day_summary(baseline, day.isoformat())
-    capital = decimal_value(baseline.get("account_baseline_equity_usd"))
+    configured_start = parse_timestamp(DEFAULT_PLATFORM_START)
+    if configured_start is None:
+        raise RuntimeError("configured account-equity statistics start is invalid")
+    statistics_start_day = configured_start.astimezone(BEIJING_TIMEZONE).date()
+    tracking_record = history.get(statistics_start_day.isoformat()) or {}
+    capital = decimal_value(tracking_record.get("start_equity_usd"))
+    tracking_started_at = parse_timestamp(tracking_record.get("first_sample_at"))
     daily_start = decimal_value(record.get("start_equity_usd"))
     daily_latest = decimal_value(record.get("latest_equity_usd"))
     sample_count = int(record.get("sample_count") or 0)
@@ -278,7 +284,25 @@ def build_account_equity_payload(
         else None
     )
     complete_day = complete_beijing_equity_day(record, day.isoformat())
-    daily_cashflow = decimal_value(fill_record.get("external_cashflow_usd"))
+    observed = (
+        now
+        or parse_timestamp(
+            equity_state.get("last_sample_at") or baseline.get("latest_account_snapshot_at")
+        )
+        or datetime.now(timezone.utc)
+    )
+    current_sample_at = parse_timestamp(
+        equity_state.get("last_sample_at") or baseline.get("latest_account_snapshot_at")
+    )
+    daily_period_start = datetime.combine(
+        day, datetime.min.time(), tzinfo=BEIJING_TIMEZONE
+    ).astimezone(timezone.utc)
+    daily_period_end = daily_period_start + timedelta(days=1)
+    if observed.astimezone(timezone.utc) < daily_period_end:
+        daily_period_end = observed.astimezone(timezone.utc)
+    daily_cashflow = _registered_cashflow_between(
+        baseline, daily_period_start, daily_period_end
+    )
     daily_pnl = (
         observed_period_change - daily_cashflow
         if complete_day and observed_period_change is not None and daily_cashflow is not None
@@ -287,37 +311,38 @@ def build_account_equity_payload(
     latest_total = decimal_value(equity_state.get("latest_combined_equity_usd"))
     if latest_total is None:
         latest_total = decimal_value(baseline.get("latest_combined_equity_usd"))
-    cashflow_value = baseline.get("external_cashflow_usd")
-    external_cashflow = decimal_value(
-        "0" if cashflow_value in (None, "") else cashflow_value
+    cumulative_cashflow = (
+        _registered_cashflow_between(baseline, tracking_started_at, current_sample_at)
+        if tracking_started_at is not None and current_sample_at is not None
+        else None
     )
     cumulative_pnl = (
-        latest_total - capital - external_cashflow
-        if latest_total is not None and capital is not None and external_cashflow is not None
+        latest_total - capital - cumulative_cashflow
+        if latest_total is not None and capital is not None and cumulative_cashflow is not None
+        else None
+    )
+    adjusted_capital = (
+        capital + cumulative_cashflow
+        if capital is not None and cumulative_cashflow is not None
+        else None
+    )
+    daily_capital = (
+        daily_start + daily_cashflow
+        if daily_start is not None and daily_cashflow is not None
         else None
     )
     daily_return = (
-        daily_pnl / capital * Decimal("100")
-        if daily_pnl is not None and capital is not None and capital > 0
+        daily_pnl / daily_capital * Decimal("100")
+        if daily_pnl is not None and daily_capital is not None and daily_capital > 0
         else None
     )
     daily_annualized = daily_return * Decimal("365") if daily_return is not None else None
     cumulative_return = (
-        cumulative_pnl / capital * Decimal("100")
-        if cumulative_pnl is not None and capital is not None and capital > 0
+        cumulative_pnl / adjusted_capital * Decimal("100")
+        if cumulative_pnl is not None and adjusted_capital is not None and adjusted_capital > 0
         else None
     )
-    observed = (
-        now
-        or parse_timestamp(
-            equity_state.get("last_sample_at") or baseline.get("latest_account_snapshot_at")
-        )
-        or datetime.now(timezone.utc)
-    )
-    baseline_at = parse_timestamp(
-        baseline.get("account_baseline_at") or baseline.get("started_at")
-    )
-    covered_days = beijing_calendar_days(baseline_at, observed)
+    covered_days = beijing_calendar_days(tracking_started_at, current_sample_at)
     annualized = (
         cumulative_return * Decimal("365") / covered_days
         if cumulative_return is not None and covered_days and covered_days > 0
@@ -349,6 +374,7 @@ def build_account_equity_payload(
         "daily_first_sample_at": record.get("first_sample_at"),
         "daily_latest_sample_at": record.get("latest_sample_at"),
         "daily_sample_count": sample_count,
+        "daily_cashflow_usd": str(daily_cashflow) if daily_cashflow is not None else None,
         "daily_closed_child_lots": int(fill_record.get("closed_child_lots") or 0),
         "daily_completed_close_groups": int(
             fill_record.get("tracked_completed_cycles") or 0
@@ -360,6 +386,9 @@ def build_account_equity_payload(
             fill_record.get("confirmed_pnl_usd") or "0"
         ),
         "run_actual_pnl_usd": str(cumulative_pnl) if cumulative_pnl is not None else None,
+        "tracking_start_equity_usd": str(capital) if capital is not None else None,
+        "tracking_start_at": tracking_started_at.isoformat() if tracking_started_at else None,
+        "tracking_cashflow_usd": str(cumulative_cashflow) if cumulative_cashflow is not None else None,
         "cumulative_confirmed_pnl_usd": str(
             baseline.get("confirmed_pnl_usd") or "0"
         ),
@@ -375,13 +404,11 @@ def build_account_equity_payload(
         "return_pct": str(cumulative_return) if cumulative_return is not None else None,
         "annualized_simple_pct": str(annualized) if annualized is not None else None,
         "covered_beijing_days": str(covered_days) if covered_days is not None else None,
-        "capital_usd": str(capital) if capital is not None else None,
-        "account_baseline_day": (
-            baseline_at.astimezone(BEIJING_TIMEZONE).date().isoformat()
-            if baseline_at is not None else None
-        ),
-        "external_cashflow_usd": str(external_cashflow) if external_cashflow is not None else None,
-        "capital_source": "verified_start_day_two_venue_equity" if capital is not None else "unavailable",
+        "account_baseline_day": statistics_start_day.isoformat(),
+        "account_baseline_at": tracking_started_at.isoformat() if tracking_started_at else None,
+        "external_cashflow_usd": str(cumulative_cashflow) if cumulative_cashflow is not None else None,
+        "capital_usd": str(adjusted_capital) if adjusted_capital is not None else None,
+        "capital_source": "first_statistics_day_equity_sample" if capital is not None else "unavailable",
         "variational_equity_usd": equity_state.get("latest_variational_equity_usd") or baseline.get("latest_variational_equity_usd"),
         "lighter_equity_usd": equity_state.get("latest_lighter_equity_usd") or baseline.get("latest_lighter_equity_usd"),
         "combined_equity_usd": str(latest_total) if latest_total is not None else None,
@@ -389,6 +416,33 @@ def build_account_equity_payload(
         "return_pnl_source": "account_equity_delta",
         "annualized_reliability": "account_equity_observation_period",
     }
+
+
+def _registered_cashflow_between(
+    baseline: dict[str, Any], start: datetime | None, end: datetime | None
+) -> Decimal | None:
+    if start is None or end is None or end < start:
+        return None
+    events = baseline.get("external_cashflow_events") or []
+    aggregate = decimal_value(baseline.get("external_cashflow_usd") or "0")
+    if aggregate is None:
+        return None
+    parsed_events: list[tuple[datetime, Decimal]] = []
+    for event in events:
+        if not isinstance(event, dict):
+            return None
+        at = parse_timestamp(event.get("observed_at"))
+        amount = decimal_value(event.get("amount_usd"))
+        if at is None or amount is None:
+            return None
+        parsed_events.append((at, amount))
+    if sum((amount for _, amount in parsed_events), Decimal("0")) != aggregate:
+        if aggregate != 0 or parsed_events:
+            return None
+    return sum(
+        (amount for at, amount in parsed_events if start <= at <= end),
+        Decimal("0"),
+    )
 
 
 def send_with_retry(
@@ -435,7 +489,8 @@ def main() -> int:
     if baseline is not None and str(baseline.get("asset") or "").upper() not in {"", args.asset.upper()}:
         raise SystemExit("daily_pnl=FAILED baseline_asset_mismatch")
     equity_state = load_account_equity_state(args.equity_state_path)
-    if baseline is not None and baseline.get("return_basis") == "account_equity_delta" and not args.dry_run:
+    account_equity_mode = baseline is not None and baseline.get("return_basis") == "account_equity_delta"
+    if account_equity_mode and not args.dry_run:
         sample, sample_reason = read_fresh_account_equity(
             args.risk_health_path,
             asset=args.asset,
@@ -448,7 +503,7 @@ def main() -> int:
             print(f"account_equity_sample=RECORDED at={sample['captured_at']}")
         else:
             print(f"account_equity_sample=SKIPPED reason={sample_reason}")
-    if args.sync_platform_data:
+    if args.sync_platform_data and not account_equity_mode:
         try:
             sync_platform_ledger(path=args.platform_ledger_path)
             print("platform_pnl_sync=PASS")
@@ -456,15 +511,24 @@ def main() -> int:
             print(f"platform_pnl_sync=FAILED reason={type(exc).__name__}:{exc}")
             return 1
     target_day = resolve_day(args.day)
-    started_day = date.fromisoformat(
-        str((baseline or {}).get("current_beijing_day") or target_day.isoformat())
-    )
-    if args.platform_ledger_path.exists():
+    if account_equity_mode:
+        configured_start = parse_timestamp(DEFAULT_PLATFORM_START)
+        started_day = (
+            configured_start.astimezone(BEIJING_TIMEZONE).date()
+            if configured_start is not None else target_day
+        )
+        if args.sync_platform_data:
+            print("platform_pnl_sync=SKIP account_equity_mode")
+    else:
+        started_day = date.fromisoformat(
+            str((baseline or {}).get("current_beijing_day") or target_day.isoformat())
+        )
+    if not account_equity_mode and args.platform_ledger_path.exists():
         platform_ledger = load_platform_ledger(args.platform_ledger_path)
         platform_started = parse_timestamp(platform_ledger.get("statistics_start"))
         if platform_started is not None:
             started_day = platform_started.astimezone(BEIJING_TIMEZONE).date()
-    else:
+    elif not account_equity_mode:
         baseline_started = parse_timestamp((baseline or {}).get("started_at"))
         if baseline_started is not None:
             started_day = baseline_started.astimezone(BEIJING_TIMEZONE).date()
@@ -491,7 +555,14 @@ def main() -> int:
         print(f"daily_pnl=SKIP already_sent key={send_key}")
         return 0
 
-    if args.platform_ledger_path.exists():
+    if account_equity_mode:
+        payload = build_daily_payload(
+            baseline,
+            asset=args.asset,
+            day=target_day,
+            equity_state=equity_state,
+        )
+    elif args.platform_ledger_path.exists():
         payload = build_platform_activity_payload(
             load_platform_ledger(args.platform_ledger_path),
             asset=args.asset,

@@ -513,26 +513,31 @@ is documented in `docs/risk_wakeup_watchdog.md`. It reads local state and the
 main runtime's small risk heartbeat only; it never enters the quote or order
 path.
 
-# Realized Var/RH PnL
+# Account Equity Var/RH PnL
 
-The realized report counts every executed ETH fill on both platforms and sums
-executed notional on both venues. Total PnL includes only realized close PnL
-and settled funding, excludes unrealized PnL on open positions, and deducts
-confirmed fees if present. Deposits and withdrawals are shown separately and
-adjust the capital denominator; they are not profit. The initial reporting
-capital is USD 241.774564 from 2026-10-05.
+The daily Telegram report uses the combined fresh equity snapshots from both
+venues. Equity change includes settled funding and unrealized PnL, so it is an
+account-return measure rather than realized-only PnL. It also reflects manual
+trades. Registered deposits and withdrawals are deducted from the return and
+adjust the capital denominator. The statistics period starts on 2026-10-05;
+its starting capital is taken from the first saved two-venue equity sample on
+that Beijing date, not from an earlier baseline.
 
-RH history is fetched through read-only Lighter history APIs. Variational
-history must be exported from the account UI: download the ETH trades CSV and
-the transfers CSV containing realized PnL, funding, fees, deposits, and
-withdrawals. Keep them private under `log/platform_pnl_imports/`; `log/` and
-CSV files are ignored by Git. Use filenames containing `trade` and
-`transfer` (or `fund`) respectively. If an export reaches 10,000 rows, split
-the requested history into smaller time ranges before importing.
+Daily reports require the strategy to be running so the five-minute systemd
+timer can save fresh equity snapshots. A day is marked partial if boundary
+coverage or continuity is insufficient. If no starting-day equity sample is
+available, cumulative return and capital are withheld rather than falling
+back to the old 2026-09-26 baseline. Equity snapshots alone cannot identify
+unregistered deposits or withdrawals; record those through the existing
+cashflow ledger when they occur.
 
-CSV presence and freshness do not prove date coverage. After checking that the
-files cover every ETH trade and money movement from the statistics start
-through the requested report end, create the local coverage attestation:
+The optional realized-activity report remains available for separate
+reconciliation. It counts exchange-reported trades and settled funding, and
+requires Var CSV exports plus a coverage attestation. That report is separate
+from the daily account-equity Telegram report.
+
+After exporting and checking the full Var history, the optional report's
+coverage attestation can be created locally:
 
 ```bash
 python tools/confirm_var_export_coverage.py \
@@ -547,23 +552,20 @@ history in Variational; without confirmation, the report stays partial. The
 report also checks export freshness, row limits, parse quality, RH pagination,
 and whether the attested interval covers the requested period.
 
-Preview or send a Beijing-day report. The installed systemd timer requests the
-prior Beijing day and synchronizes RH history:
+Preview or send a Beijing-day account-equity report. It does not synchronize
+platform history:
 
 ```bash
 python tools/daily_pnl_report.py --asset ETH --day 2026-10-06 \
-  --sync-platform-data --dry-run
-python tools/daily_pnl_report.py --asset ETH --day 2026-10-06 \
-  --sync-platform-data --force
+  --dry-run --force
+python tools/daily_pnl_report.py --asset ETH --day 2026-10-06 --force
 ```
 
-Query an arbitrary inclusive Beijing date range with the same definition:
+Query realized platform activity for an arbitrary date range separately:
 
 ```bash
 python tools/platform_pnl_report.py --start 2026-10-05 --end 2026-10-06
 ```
 
-Use `--no-sync` only when intentionally querying the last saved RH snapshot.
-Until both sources and the Var coverage attestation are complete, known
-subtotals are labeled partial and annualized return is withheld rather than
-presenting missing history as zero.
+The realized-activity report's `--no-sync` option uses the last saved RH
+snapshot. It does not affect the account-equity daily report.

@@ -311,13 +311,13 @@ def format_telegram_trade_message(
             lines = [
                 "[Var/RH] 北京时间每日收益",
                 f"日期：{_value(payload, 'beijing_day')}｜资产：{asset}｜状态：{status}",
-                f"平仓子单：{_value(payload, 'daily_closed_child_lots')} 笔｜"
+                f"程序记录平仓子单：{_value(payload, 'daily_closed_child_lots')} 笔｜"
                 f"平仓批次：{_value(payload, 'daily_completed_close_groups')} 组",
-                "双平台四腿成交量："
+                "程序记录四腿成交量："
                 f"{_localized_money(payload, 'daily_four_leg_volume_usd')}",
-                "确认成交盈亏："
+                "程序记录平仓盈亏（辅助）："
                 f"{_localized_money(payload, 'daily_confirmed_pnl_usd')}",
-                "当日账户权益变化："
+                "当日双边账户总收益（含未实现）："
                 f"{_localized_money(payload, 'beijing_day_actual_pnl_usd')}",
             ]
             if payload.get("summary_status") == "complete":
@@ -339,24 +339,27 @@ def format_telegram_trade_message(
                     "当日权益采样："
                     f"{_value(payload, 'daily_first_sample_at')} 至 "
                     f"{_value(payload, 'daily_latest_sample_at')}",
-                    "累计确认盈亏："
+                    "累计程序记录平仓盈亏（辅助）："
                     f"{_localized_money(payload, 'cumulative_confirmed_pnl_usd')}",
-                    "累计四腿成交量："
+                    "累计程序记录四腿成交量（辅助）："
                     f"{_localized_money(payload, 'cumulative_four_leg_volume_usd')}",
-                    "累计账户净收益："
+                    "统计期双边账户总收益（含未实现）："
                     f"{_localized_money(payload, 'run_actual_pnl_usd')}",
                     "累计账户收益率："
                     f"{_localized_percent(payload, 'return_pct')}",
                     "累计简单年化："
                     f"{_localized_percent(payload, 'annualized_simple_pct')}",
                     f"统计起始日：{_value(payload, 'account_baseline_day')}",
-                    f"统计本金：{_localized_money(payload, 'capital_usd')}",
+                    f"统计起始权益快照：{_value(payload, 'account_baseline_at')}",
+                    f"期初双边权益：{_localized_money(payload, 'tracking_start_equity_usd')}",
+                    f"统计本金（按已登记净充提调整）：{_localized_money(payload, 'capital_usd')}",
+                    f"统计期间已登记净充提：{_localized_money(payload, 'external_cashflow_usd')}",
                     f"最新双边权益：{_localized_money(payload, 'combined_equity_usd')}",
                     f"Variational 权益：{_localized_money(payload, 'variational_equity_usd')}",
                     f"RH 权益：{_localized_money(payload, 'lighter_equity_usd')}",
                     f"快照时间：{_value(payload, 'account_snapshot_at')}",
-                    "口径：累计账户净收益=双边权益净变化-已登记净充值；成交盈亏/成交量不重复相加",
-                    "说明：账户权益含未实现盈亏及手动交易影响；部分时段不作为全天收益",
+                    "口径：双边账户权益净变化扣除已登记净充提；资金费已反映在权益中",
+                    "说明：账户收益含未平仓浮盈亏和手动成交；充提需登记；成交统计为程序记录辅助项",
                 ]
             )
             return "\n".join(lines)
