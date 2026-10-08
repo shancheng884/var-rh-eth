@@ -307,6 +307,18 @@ def validate_state(
         return False, f"open_lots_present count={len(open_lots)} asset={asset}"
     if pending_actions:
         return False, f"pending_actions_present count={len(pending_actions)} asset={asset}"
+    halted_reason = str(state.get("v4_batch_halted_reason") or "")
+    if (
+        config.v4_live_mode
+        and halted_reason
+        and not collect_only
+        and not reset_state_after_manual_flat
+    ):
+        return (
+            False,
+            f"state_v4_batch_halted asset={asset} reason={halted_reason} "
+            "action=verify_both_exchanges_flat_then_reset_local_state_only",
+        )
     effective_max_cycles = (
         config.calibration_max_cycles
         if config.calibration_mode
@@ -1159,7 +1171,12 @@ def main() -> int:
     print(state_message)
     print(disk_warning())
     if not state_ok:
-        print("REFUSE_START reason=local_live_state_not_flat")
+        refusal_reason = (
+            "persisted_v4_batch_halt"
+            if state_message.startswith("state_v4_batch_halted")
+            else "local_live_state_not_flat"
+        )
+        print(f"REFUSE_START reason={refusal_reason}")
         return 2
     if not args.dry_run and not disk_start_allowed():
         print(

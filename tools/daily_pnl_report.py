@@ -135,6 +135,7 @@ def _realized_snapshot(row: dict[str, Any]) -> dict[str, Any] | None:
         row.get("event") != "live_inventory_account_snapshot"
         or row.get("snapshot_status") != "complete"
         or row.get("snapshot_errors") not in ({}, None)
+        or row.get("variational_equity_formula") != "balance_includes_upnl"
     ):
         return None
     captured = parse_timestamp(row.get("snapshot_captured_at") or row.get("logged_at"))
@@ -148,6 +149,7 @@ def _realized_snapshot(row: dict[str, Any]) -> dict[str, Any] | None:
     if (
         captured is None
         or None in {var_balance, var_upnl, var_equity, rh_balance, rh_equity, combined}
+        or abs(var_equity - var_balance) > Decimal("0.05")
         or abs(var_equity + rh_equity - combined) > Decimal("0.05")
         or rh_upnl is not None
         and abs(rh_equity - rh_balance - rh_upnl) > Decimal("0.05")
@@ -158,6 +160,9 @@ def _realized_snapshot(row: dict[str, Any]) -> dict[str, Any] | None:
         "variational_equity_usd": str(var_equity),
         "lighter_equity_usd": str(rh_equity),
         "combined_equity_usd": str(combined),
+        "variational_equity_formula_version": VAR_EQUITY_FORMULA_VERSION,
+        "snapshot_stage": row.get("snapshot_stage"),
+        "account_snapshot_flat": row.get("account_snapshot_flat") is True,
         "variational_realized_balance_usd": str(var_balance - var_upnl),
         "lighter_realized_balance_usd": str(rh_balance),
         "combined_realized_balance_usd": str(var_balance - var_upnl + rh_balance),
@@ -367,11 +372,16 @@ def build_realized_balance_payload(
             "beijing_day": day.isoformat(),
             "pnl_data_reason": "requested_day_precedes_first_complete_balance_snapshot",
         }
-    if not snapshots:
-        snapshots = []
+    snapshots = [
+        row for row in snapshots
+        if (captured := parse_timestamp(row.get("captured_at"))) is not None
+        and start_at <= captured < day_end
+    ]
 
     history = equity_state.get("realized_daily_history") or {}
     day_record = history.get(day.isoformat()) or {}
+    if day_record.get("variational_equity_formula_version") != VAR_EQUITY_FORMULA_VERSION:
+        day_record = {}
     points: dict[str, dict[str, Any]] = {
         str(row["captured_at"]): row
         for row in snapshots
@@ -380,7 +390,12 @@ def build_realized_balance_payload(
     }
     first_history_at = parse_timestamp(day_record.get("first_sample_at"))
     last_history_at = parse_timestamp(day_record.get("latest_sample_at"))
-    if first_history_at is not None and day_record.get("start_realized_balance_usd") is not None:
+    if (
+        first_history_at is not None
+        and start_at <= first_history_at < day_end
+        and day_start <= first_history_at
+        and day_record.get("start_realized_balance_usd") is not None
+    ):
         points[first_history_at.isoformat()] = {
             "captured_at": first_history_at.isoformat(),
             "combined_realized_balance_usd": day_record.get("start_realized_balance_usd"),
@@ -388,7 +403,12 @@ def build_realized_balance_payload(
             "variational_equity_usd": None,
             "lighter_equity_usd": None,
         }
-    if last_history_at is not None and day_record.get("latest_realized_balance_usd") is not None:
+    if (
+        last_history_at is not None
+        and start_at <= last_history_at < day_end
+        and day_start <= last_history_at
+        and day_record.get("latest_realized_balance_usd") is not None
+    ):
         points[last_history_at.isoformat()] = {
             "captured_at": last_history_at.isoformat(),
             "combined_realized_balance_usd": day_record.get("latest_realized_balance_usd"),
@@ -409,7 +429,13 @@ def build_realized_balance_payload(
     )
     observed_daily_change = (
         latest_realized - first_realized
-        if len(ordered_points) >= 2
+        if (
+            len(ordered_points) >= 2
+            or (
+                len(ordered_points) == 1
+                and parse_timestamp(first_point.get("captured_at")) == start_at
+            )
+        )
         and first_realized is not None
         and latest_realized is not None
         else None
@@ -426,7 +452,8 @@ def build_realized_balance_payload(
     if recorded_gap is not None:
         max_gap = max(max_gap, recorded_gap)
     day_complete = bool(
-        day_record.get("sample_count", 0) >= 2
+        not (day_start < start_at < day_end)
+        and day_record.get("sample_count", 0) >= 2
         and day_record.get("coverage_complete") is True
         and complete_beijing_equity_day(
             {
@@ -438,58 +465,80 @@ def build_realized_balance_payload(
             day.isoformat(),
         )
     )
-    daily_cashflow = _cashflows_between(baseline, platform_ledger, day_start, day_end)
+    latest_day_at = parse_timestamp(latest_point.get("captured_at")) if latest_point else None
+    daily_cashflow = (
+        _cashflows_between(
+            baseline,
+            platform_ledger,
+            max(day_start, start_at),
+            latest_day_at + timedelta(microseconds=1),
+        )
+        if latest_day_at is not None else Decimal("0")
+    )
     daily_pnl = (
         observed_daily_change - daily_cashflow
         if observed_daily_change is not None
         else None
     )
-    latest_captured = parse_timestamp(equity_state.get("last_sample_at"))
-    latest_realized_captured = parse_timestamp(
-        equity_state.get("latest_realized_sample_at")
-    )
-    latest_total = decimal_value(equity_state.get("latest_combined_equity_usd"))
-    latest_var_equity = equity_state.get("latest_variational_equity_usd")
-    latest_rh_equity = equity_state.get("latest_lighter_equity_usd")
-    last_snapshot = snapshots[-1] if snapshots else None
-    snapshot_at = parse_timestamp(last_snapshot.get("captured_at")) if last_snapshot else None
-    if last_snapshot and (
-        latest_captured is None
-        or snapshot_at is not None and snapshot_at > latest_captured
+    candidates = [
+        row for row in snapshots
+        if day_start <= parse_timestamp(row.get("captured_at")) < day_end
+    ]
+    history_at = parse_timestamp(day_record.get("latest_sample_at"))
+    if history_at is not None and max(day_start, start_at) <= history_at < day_end:
+        candidates.append({
+            "captured_at": history_at.isoformat(),
+            "combined_equity_usd": day_record.get("latest_equity_usd"),
+            "variational_equity_usd": day_record.get("latest_variational_equity_usd"),
+            "lighter_equity_usd": day_record.get("latest_lighter_equity_usd"),
+            "combined_realized_balance_usd": day_record.get("latest_realized_balance_usd"),
+        })
+    state_at = parse_timestamp(equity_state.get("last_sample_at"))
+    realized_state_at = parse_timestamp(equity_state.get("latest_realized_sample_at"))
+    if (
+        state_at is not None
+        and state_at == realized_state_at
+        and max(day_start, start_at) <= state_at < day_end
+        and equity_state.get("variational_equity_formula_version")
+        == VAR_EQUITY_FORMULA_VERSION
     ):
-        latest_captured = snapshot_at
-        latest_total = decimal_value(last_snapshot.get("combined_equity_usd"))
-        latest_var_equity = last_snapshot.get("variational_equity_usd")
-        latest_rh_equity = last_snapshot.get("lighter_equity_usd")
-    if latest_captured is None or latest_total is None:
-        if last_snapshot:
-            latest_captured = snapshot_at
-            latest_total = decimal_value(last_snapshot.get("combined_equity_usd"))
-            latest_var_equity = last_snapshot.get("variational_equity_usd")
-            latest_rh_equity = last_snapshot.get("lighter_equity_usd")
-    latest_realized = decimal_value(
-        equity_state.get("latest_combined_realized_balance_usd")
-    ) or decimal_value(
-        (history.get(
-            (latest_realized_captured or latest_captured).astimezone(
-                BEIJING_TIMEZONE
-            ).date().isoformat()
-        ) or {}).get(
-            "latest_realized_balance_usd"
-        )
-        if latest_realized_captured is not None or latest_captured is not None
-        else None
+        candidates.append({
+            "captured_at": state_at.isoformat(),
+            "combined_equity_usd": equity_state.get("latest_combined_equity_usd"),
+            "variational_equity_usd": equity_state.get("latest_variational_equity_usd"),
+            "lighter_equity_usd": equity_state.get("latest_lighter_equity_usd"),
+            "combined_realized_balance_usd": equity_state.get(
+                "latest_combined_realized_balance_usd"
+            ),
+        })
+    candidates = [
+        row for row in candidates
+        if all(decimal_value(row.get(key)) is not None for key in (
+            "combined_equity_usd", "variational_equity_usd",
+            "lighter_equity_usd", "combined_realized_balance_usd",
+        ))
+        and abs(
+            decimal_value(row["variational_equity_usd"])
+            + decimal_value(row["lighter_equity_usd"])
+            - decimal_value(row["combined_equity_usd"])
+        ) <= Decimal("0.05")
+    ]
+    latest_account = max(candidates, key=lambda row: row["captured_at"]) if candidates else None
+    latest_captured = parse_timestamp(latest_account["captured_at"]) if latest_account else None
+    latest_total = decimal_value(latest_account["combined_equity_usd"]) if latest_account else None
+    latest_var_equity = latest_account["variational_equity_usd"] if latest_account else None
+    latest_rh_equity = latest_account["lighter_equity_usd"] if latest_account else None
+    latest_realized = (
+        decimal_value(latest_account["combined_realized_balance_usd"])
+        if latest_account else None
     )
-    if last_snapshot and snapshot_at is not None and (
-        latest_realized_captured is None or snapshot_at > latest_realized_captured
-    ):
-        latest_realized_captured = snapshot_at
-        latest_realized = decimal_value(
-            last_snapshot.get("combined_realized_balance_usd")
-        )
     start_realized = decimal_value(tracking.get("start_realized_balance_usd"))
-    cumulative_cashflow = _cashflows_between(
-        baseline, platform_ledger, start_at, latest_realized_captured or latest_captured or observed
+    cumulative_cashflow = (
+        _cashflows_between(
+            baseline, platform_ledger, start_at,
+            latest_captured + timedelta(microseconds=1),
+        )
+        if latest_captured else Decimal("0")
     )
     cumulative_pnl = (
         latest_realized - start_realized - cumulative_cashflow
@@ -498,19 +547,20 @@ def build_realized_balance_payload(
     )
     capital = decimal_value(tracking.get("start_equity_usd"))
     elapsed_days = (
-        Decimal(str(((latest_realized_captured or latest_captured or observed) - start_at).total_seconds()))
-        / Decimal("86400")
+        Decimal(str((latest_captured - start_at).total_seconds())) / Decimal("86400")
+        if latest_captured else Decimal("0")
     )
     cumulative_return = (
         cumulative_pnl / capital * Decimal("100")
         if cumulative_pnl is not None and capital is not None and capital > 0
         else None
     )
-    annualized = (
-        cumulative_return * Decimal("365") / elapsed_days
-        if cumulative_return is not None and elapsed_days > 0
-        else None
-    )
+    if cumulative_return == 0:
+        annualized = Decimal("0")
+    elif cumulative_return is not None and elapsed_days > 0:
+        annualized = cumulative_return * Decimal("365") / elapsed_days
+    else:
+        annualized = None
     cashflow_verified = _cashflow_sources_verified(platform_ledger)
     status = "complete" if day_complete and cashflow_verified else "partial"
     tracking_day = start_at.astimezone(BEIJING_TIMEZONE).date().isoformat()
@@ -542,8 +592,8 @@ def build_realized_balance_payload(
         "lighter_equity_usd": latest_rh_equity,
         "account_snapshot_at": latest_captured.isoformat() if latest_captured else None,
         "realized_balance_snapshot_at": (
-            latest_realized_captured.isoformat()
-            if latest_realized_captured
+            latest_captured.isoformat()
+            if latest_captured
             else None
         ),
         "realized_pnl_basis": "change_in_var_balance_minus_upnl_plus_rh_collateral",
@@ -566,20 +616,39 @@ def reset_realized_tracking_baseline(
     equity_state_path: Path,
     risk_health_path: Path,
     apply: bool,
+    snapshot_at: datetime | None = None,
 ) -> int:
     if asset.upper() != "ETH":
         raise RuntimeError("cumulative baseline reset currently supports ETH only")
-    sample, reason = read_fresh_account_equity(
-        risk_health_path,
-        asset=asset,
-    )
-    if sample is None:
-        raise RuntimeError(f"fresh complete account snapshot unavailable: {reason}")
+    if snapshot_at is None:
+        sample, reason = read_fresh_account_equity(
+            risk_health_path,
+            asset=asset,
+        )
+        if sample is None:
+            raise RuntimeError(f"fresh complete account snapshot unavailable: {reason}")
+    else:
+        if snapshot_at.tzinfo is None:
+            raise ValueError("historical reset timestamp must include a timezone")
+        target = snapshot_at.astimezone(timezone.utc)
+        _, _, snapshots = _scan_order_metrics(
+            asset=asset,
+            tracking_start=target,
+            day_start=target,
+            day_end=target + timedelta(microseconds=1),
+        )
+        matches = [
+            row for row in snapshots
+            if parse_timestamp(row.get("captured_at")) == target
+        ]
+        if len(matches) != 1 or not matches[0].get("account_snapshot_flat"):
+            raise RuntimeError("exact complete flat account snapshot not found")
+        sample = matches[0]
 
     state = load_account_equity_state(equity_state_path)
     health_at = parse_timestamp(sample.get("captured_at"))
     state_at = parse_timestamp(state.get("latest_realized_sample_at"))
-    if state_at is not None and health_at is not None and state_at > health_at:
+    if snapshot_at is None and state_at is not None and health_at is not None and state_at > health_at:
         state_age = (datetime.now(timezone.utc) - state_at).total_seconds()
         state_realized_values = {
             "variational_realized_balance_usd": state.get(
@@ -636,6 +705,8 @@ def reset_realized_tracking_baseline(
     print("reset_start_at=" + new_tracking["start_at"])
     print("reset_starting_capital_usd=" + new_tracking["start_equity_usd"])
     print("reset_start_realized_balance_usd=" + new_tracking["start_realized_balance_usd"])
+    print("reset_variational_equity_usd=" + str(sample["variational_equity_usd"]))
+    print("reset_lighter_equity_usd=" + str(sample["lighter_equity_usd"]))
     if not apply:
         print("cumulative_reset=DRY_RUN add --apply-cumulative-reset to apply")
         return 0
@@ -1036,6 +1107,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--reset-cumulative-baseline", action="store_true")
     parser.add_argument("--apply-cumulative-reset", action="store_true")
+    parser.add_argument("--reset-cumulative-baseline-at", type=str)
     parser.add_argument("--attempts", type=int, default=3)
     return parser
 
@@ -1044,6 +1116,19 @@ def main() -> int:
     args = build_parser().parse_args()
     if args.apply_cumulative_reset and not args.reset_cumulative_baseline:
         raise SystemExit("--apply-cumulative-reset requires --reset-cumulative-baseline")
+    if args.reset_cumulative_baseline_at and not args.reset_cumulative_baseline:
+        raise SystemExit("--reset-cumulative-baseline-at requires --reset-cumulative-baseline")
+    snapshot_at = None
+    if args.reset_cumulative_baseline_at is not None:
+        try:
+            raw_snapshot_at = datetime.fromisoformat(
+                args.reset_cumulative_baseline_at.replace("Z", "+00:00")
+            )
+        except ValueError:
+            raw_snapshot_at = None
+        if raw_snapshot_at is None or raw_snapshot_at.tzinfo is None:
+            raise SystemExit("--reset-cumulative-baseline-at requires a valid timezone-aware timestamp")
+        snapshot_at = raw_snapshot_at.astimezone(timezone.utc)
     if args.apply_cumulative_reset and args.dry_run:
         raise SystemExit("--apply-cumulative-reset cannot be combined with --dry-run")
     load_dotenv(ROOT / ".env")
@@ -1054,6 +1139,7 @@ def main() -> int:
                 equity_state_path=args.equity_state_path,
                 risk_health_path=args.risk_health_path,
                 apply=args.apply_cumulative_reset,
+                snapshot_at=snapshot_at,
             )
         except (OSError, RuntimeError, ValueError) as exc:
             print(f"cumulative_reset=FAILED reason={type(exc).__name__}:{exc}")

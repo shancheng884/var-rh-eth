@@ -204,6 +204,8 @@ def record_account_equity_sample(
         <= Decimal("0.01")
     ):
         realized_record = dict(realized_history.get(day) or {})
+        if realized_record.get("variational_equity_formula_version") != formula_version:
+            realized_record = {}
         realized_first = parse_timestamp(realized_record.get("first_sample_at"))
         realized_last = parse_timestamp(realized_record.get("latest_sample_at"))
         realized_gap = (
@@ -233,6 +235,9 @@ def record_account_equity_sample(
                 "latest_variational_realized_balance_usd": str(realized_var),
                 "latest_lighter_realized_balance_usd": str(realized_lighter),
                 "latest_equity_usd": sample["combined_equity_usd"],
+                "latest_variational_equity_usd": sample["variational_equity_usd"],
+                "latest_lighter_equity_usd": sample["lighter_equity_usd"],
+                "variational_equity_formula_version": formula_version,
                 "sample_count": int(realized_record.get("sample_count") or 0) + 1,
                 "max_sample_gap_seconds": (
                     str(realized_gap) if realized_gap is not None else None

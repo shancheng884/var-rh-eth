@@ -443,6 +443,21 @@ flat, then rearms and starts another episode. `max_cycles=0` is accepted only
 with this explicit real-gradient mode. The cumulative run-loss fuse, account
 risk actions, exchange reconciliation, and maintenance drain remain active.
 
+A stop-loss batch halt is persisted in `log/live_inventory_state.json` as
+`v4_batch_halted_reason`. Restarting the process does not clear it. The live
+launcher refuses a V4 start with `REFUSE_START reason=persisted_v4_batch_halt`
+instead of briefly starting and exiting. After investigating the stop loss,
+confirm both exchanges have zero ETH positions and zero open orders, then use
+the existing exchange-verified one-shot reset before starting a new batch:
+
+```bash
+.venv/bin/python tools/live.py --asset ETH --reset-local-state-only
+```
+
+This backs up and resets only local inventory state; it does not start trading.
+Do not run it while either venue has a position, an open order, or an unresolved
+action. The separate daily-PnL tracking baseline is not reset by this command.
+
 To end a healthy V4 test position before its normal profit exit, stop the old
 process without changing `live_inventory_state.json`, then run the reconciled
 one-shot exit:
@@ -538,14 +553,21 @@ capital denominator.
 
 The cumulative start is stored in
 `log/account_equity_daily_state.json` under `realized_tracking`. To reset it,
-the strategy must be publishing a fresh, complete two-venue snapshot with no
-pending actions. Preview first, then apply; applying backs up the state file,
-starts cumulative PnL and trade volume at that snapshot, and retains daily
-history:
+use either a fresh, complete two-venue snapshot with no pending actions or an
+exact historical complete flat account snapshot from `log/order_metrics.jsonl`.
+Preview first, then apply; applying backs up the state file and starts
+cumulative PnL and trade volume at that snapshot. Historical reset timestamps
+must include a timezone and match a recorded snapshot exactly:
 
 ```bash
 python tools/daily_pnl_report.py --asset ETH --reset-cumulative-baseline
 python tools/daily_pnl_report.py --asset ETH --reset-cumulative-baseline \
+  --apply-cumulative-reset
+
+.venv/bin/python tools/daily_pnl_report.py --asset ETH --reset-cumulative-baseline \
+  --reset-cumulative-baseline-at 2026-10-08T16:09:32.991765+00:00
+.venv/bin/python tools/daily_pnl_report.py --asset ETH --reset-cumulative-baseline \
+  --reset-cumulative-baseline-at 2026-10-08T16:09:32.991765+00:00 \
   --apply-cumulative-reset
 ```
 

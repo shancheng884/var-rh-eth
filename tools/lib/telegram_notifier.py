@@ -309,34 +309,20 @@ def format_telegram_trade_message(
                 "partial": "部分时段",
                 "unavailable": "数据不足",
             }.get(str(_value(payload, "summary_status")), _value(payload, "summary_status"))
-            estimate_marker = "" if payload.get("cashflow_verified") else "（充提流水未完整核验）"
             lines = [
                 "[Var/RH] 北京时间每日收益",
                 f"日期：{_value(payload, 'beijing_day')}｜资产：{asset}｜状态：{status}",
-                f"双平台成交笔数：{_value(payload, 'daily_trade_count')} 笔（开仓、平仓子单均计）",
-                f"双平台总成交量：{_localized_money(payload, 'daily_volume_usd')}",
-                f"当日双平台总盈亏{estimate_marker}：{_localized_money(payload, 'daily_net_pnl_usd')}",
+                f"今日平台成交笔数：{_value(payload, 'daily_trade_count')} 笔（开仓、平仓子单均计）",
+                f"今日平台总成交量：{_localized_money(payload, 'daily_volume_usd')}",
+                f"今日双平台总盈亏：{_localized_money(payload, 'daily_net_pnl_usd')}",
                 f"累计双平台成交笔数：{_value(payload, 'cumulative_trade_count')} 笔",
                 f"累计双平台总成交量：{_localized_money(payload, 'cumulative_volume_usd')}",
-                f"累计双平台总盈亏{estimate_marker}：{_localized_money(payload, 'cumulative_net_pnl_usd')}",
+                f"累计双平台总盈亏：{_localized_money(payload, 'cumulative_net_pnl_usd')}",
                 f"累计简单年化：{_localized_percent(payload, 'annualized_simple_pct')}",
                 f"统计起始日：{_value(payload, 'statistics_start_day')}",
-                f"统计本金：{_localized_money(payload, 'capital_usd')}",
-                f"最新双边权益：{_localized_money(payload, 'combined_equity_usd')}",
                 f"Variational 权益：{_localized_money(payload, 'variational_equity_usd')}",
                 f"RH 权益：{_localized_money(payload, 'lighter_equity_usd')}",
-                f"权益快照：{_value(payload, 'account_snapshot_at')}",
-                "口径：Variational余额扣除未实现盈亏＋RH抵押余额变化；已实现盈亏与资金费计入，未平仓浮盈亏不计",
-                f"当日采样：{_value(payload, 'daily_sample_start_at')} 至 {_value(payload, 'daily_sample_end_at')}",
             ]
-            if not payload.get("daily_coverage_complete"):
-                lines.append(
-                    "说明：当日样本未覆盖完整北京时间日；盈亏为已采样时段变化"
-                )
-            if not payload.get("cashflow_verified"):
-                lines.append(
-                    "说明：已扣除账本中可识别充提；Variational自动充提历史不可用，相关区间为暂估"
-                )
             return "\n".join(lines)
         if payload.get("summary_scope") == "account_equity_daily":
             status = {
