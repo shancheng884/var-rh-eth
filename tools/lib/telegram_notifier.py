@@ -26,6 +26,7 @@ TELEGRAM_EVENT_TYPES = {
     "live_inventory_v4_entry_blocked",
     "live_inventory_exit_blocked",
     "live_inventory_manual_review_required",
+    "live_inventory_loss_review_alert",
     "live_inventory_runtime_fuse_triggered",
     "live_inventory_basis_quote_failed",
     "live_inventory_v4_strong_single_auto_disabled",
@@ -302,6 +303,41 @@ def format_telegram_trade_message(
                 ]
                 lines.append("数据未完整原因：" + ("；".join(reasons) or "来源检查未通过"))
             return "\n".join(lines)
+        if payload.get("summary_scope") == "realized_balance_daily":
+            status = {
+                "complete": "完整日",
+                "partial": "部分时段",
+                "unavailable": "数据不足",
+            }.get(str(_value(payload, "summary_status")), _value(payload, "summary_status"))
+            estimate_marker = "" if payload.get("cashflow_verified") else "（充提流水未完整核验）"
+            lines = [
+                "[Var/RH] 北京时间每日收益",
+                f"日期：{_value(payload, 'beijing_day')}｜资产：{asset}｜状态：{status}",
+                f"双平台成交笔数：{_value(payload, 'daily_trade_count')} 笔（开仓、平仓子单均计）",
+                f"双平台总成交量：{_localized_money(payload, 'daily_volume_usd')}",
+                f"当日双平台总盈亏{estimate_marker}：{_localized_money(payload, 'daily_net_pnl_usd')}",
+                f"累计双平台成交笔数：{_value(payload, 'cumulative_trade_count')} 笔",
+                f"累计双平台总成交量：{_localized_money(payload, 'cumulative_volume_usd')}",
+                f"累计双平台总盈亏{estimate_marker}：{_localized_money(payload, 'cumulative_net_pnl_usd')}",
+                f"累计简单年化：{_localized_percent(payload, 'annualized_simple_pct')}",
+                f"统计起始日：{_value(payload, 'statistics_start_day')}",
+                f"统计本金：{_localized_money(payload, 'capital_usd')}",
+                f"最新双边权益：{_localized_money(payload, 'combined_equity_usd')}",
+                f"Variational 权益：{_localized_money(payload, 'variational_equity_usd')}",
+                f"RH 权益：{_localized_money(payload, 'lighter_equity_usd')}",
+                f"权益快照：{_value(payload, 'account_snapshot_at')}",
+                "口径：Variational余额扣除未实现盈亏＋RH抵押余额变化；已实现盈亏与资金费计入，未平仓浮盈亏不计",
+                f"当日采样：{_value(payload, 'daily_sample_start_at')} 至 {_value(payload, 'daily_sample_end_at')}",
+            ]
+            if not payload.get("daily_coverage_complete"):
+                lines.append(
+                    "说明：当日样本未覆盖完整北京时间日；盈亏为已采样时段变化"
+                )
+            if not payload.get("cashflow_verified"):
+                lines.append(
+                    "说明：已扣除账本中可识别充提；Variational自动充提历史不可用，相关区间为暂估"
+                )
+            return "\n".join(lines)
         if payload.get("summary_scope") == "account_equity_daily":
             status = {
                 "complete": "完整日",
@@ -486,12 +522,17 @@ def format_telegram_trade_message(
                 f"已合并重复提醒：{_value(payload, 'telegram_suppressed_repeats')}",
             ]
         )
-    if event_type == "live_inventory_manual_review_required":
+    if event_type in {
+        "live_inventory_manual_review_required",
+        "live_inventory_loss_review_alert",
+    }:
         return "\n".join(
             [
                 "[Var/Lighter] 需要人工核对",
                 f"资产：{asset}｜原因：{_reason_cn(_value(payload, 'reason'))}",
+                f"当前预计亏损：{_value(payload, 'pnl_bps')} bps｜提醒阈值：{_value(payload, 'threshold_bps')} bps",
                 f"本地未平仓层数：{_value(payload, 'open_lots_total')}",
+                "动作：不自动止损；暂停新开仓和加仓，现有仓位继续按正常退出条件管理",
                 f"运行编号：{run_id}",
             ]
         )

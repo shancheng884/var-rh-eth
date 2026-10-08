@@ -90,16 +90,37 @@ def read_fresh_account_equity(
         or abs(variational + lighter - combined) > Decimal("0.01")
     ):
         return None, "two_venue_equity_incomplete_or_inconsistent"
-    return (
-        {
+    sample = {
             "captured_at": observed.isoformat(),
             "variational_equity_usd": str(variational),
             "lighter_equity_usd": str(lighter),
             "combined_equity_usd": str(combined),
             "variational_equity_formula_version": VAR_EQUITY_FORMULA_VERSION,
-        },
-        "ok",
-    )
+    }
+    var_balance = _decimal(health.get("variational_balance_usd"))
+    var_upnl = _decimal(health.get("variational_upnl_usd"))
+    lighter_collateral = _decimal(health.get("lighter_collateral_usd"))
+    lighter_upnl = _decimal(health.get("lighter_unrealized_pnl_usd"))
+    lighter_check = _decimal(health.get("lighter_realized_balance_check_usd"))
+    if (
+        var_balance is not None
+        and var_upnl is not None
+        and lighter_collateral is not None
+        and lighter_upnl is not None
+        and lighter_check is not None
+        and abs(lighter_check) <= Decimal("0.05")
+    ):
+        sample.update(
+            {
+                "variational_realized_balance_usd": str(var_balance - var_upnl),
+                "lighter_realized_balance_usd": str(lighter_collateral),
+                "combined_realized_balance_usd": str(
+                    var_balance - var_upnl + lighter_collateral
+                ),
+                "lighter_realized_balance_check_usd": str(lighter_check),
+            }
+        )
+    return sample, "ok"
 
 
 def complete_beijing_equity_day(record: dict[str, Any], day: str) -> bool:
@@ -171,6 +192,57 @@ def record_account_equity_sample(
     )
     record["coverage_complete"] = complete_beijing_equity_day(record, day)
     history[day] = record
+    realized_history = dict(state.get("realized_daily_history") or {})
+    realized_total = _decimal(sample.get("combined_realized_balance_usd"))
+    realized_var = _decimal(sample.get("variational_realized_balance_usd"))
+    realized_lighter = _decimal(sample.get("lighter_realized_balance_usd"))
+    if (
+        realized_total is not None
+        and realized_var is not None
+        and realized_lighter is not None
+        and abs(realized_var + realized_lighter - realized_total)
+        <= Decimal("0.01")
+    ):
+        realized_record = dict(realized_history.get(day) or {})
+        realized_first = parse_timestamp(realized_record.get("first_sample_at"))
+        realized_last = parse_timestamp(realized_record.get("latest_sample_at"))
+        realized_gap = (
+            Decimal("0")
+            if realized_first is None
+            else _decimal(realized_record.get("max_sample_gap_seconds"))
+        )
+        if realized_first is None:
+            realized_record.update(
+                {
+                    "first_sample_at": observed.isoformat(),
+                    "start_realized_balance_usd": str(realized_total),
+                    "start_variational_realized_balance_usd": str(realized_var),
+                    "start_lighter_realized_balance_usd": str(realized_lighter),
+                    "start_equity_usd": sample["combined_equity_usd"],
+                }
+            )
+        if realized_last is not None and realized_gap is not None:
+            realized_gap = max(
+                realized_gap,
+                Decimal(str((observed - realized_last).total_seconds())),
+            )
+        realized_record.update(
+            {
+                "latest_sample_at": observed.isoformat(),
+                "latest_realized_balance_usd": str(realized_total),
+                "latest_variational_realized_balance_usd": str(realized_var),
+                "latest_lighter_realized_balance_usd": str(realized_lighter),
+                "latest_equity_usd": sample["combined_equity_usd"],
+                "sample_count": int(realized_record.get("sample_count") or 0) + 1,
+                "max_sample_gap_seconds": (
+                    str(realized_gap) if realized_gap is not None else None
+                ),
+            }
+        )
+        realized_record["coverage_complete"] = complete_beijing_equity_day(
+            realized_record, day
+        )
+        realized_history[day] = realized_record
     state.update(
         {
             "schema_version": DAILY_EQUITY_STATE_SCHEMA,
@@ -182,7 +254,25 @@ def record_account_equity_sample(
             "latest_combined_equity_usd": sample["combined_equity_usd"],
             "variational_equity_formula_version": formula_version,
             "daily_history": dict(sorted(history.items())[-400:]),
+            "realized_daily_history": dict(
+                sorted(realized_history.items())[-400:]
+            ),
         }
     )
+    if sample.get("combined_realized_balance_usd") is not None:
+        state.update(
+            {
+                "latest_variational_realized_balance_usd": sample.get(
+                    "variational_realized_balance_usd"
+                ),
+                "latest_lighter_realized_balance_usd": sample.get(
+                    "lighter_realized_balance_usd"
+                ),
+                "latest_combined_realized_balance_usd": sample.get(
+                    "combined_realized_balance_usd"
+                ),
+                "latest_realized_sample_at": observed.isoformat(),
+            }
+        )
     _write_state(path, state)
     return state

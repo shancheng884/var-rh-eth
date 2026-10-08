@@ -284,6 +284,11 @@ LIVE_INVENTORY_BASIS_V4_REARM_CONFIRM_SAMPLES = 3
 LIVE_INVENTORY_BASIS_V4_MAX_HOLD_COOLDOWN_SECONDS = 1800
 LIVE_INVENTORY_BASIS_V4_THRESHOLD_CACHE_SECONDS = 30
 LIVE_INVENTORY_VARIATIONAL_MAX_FUTURE_SKEW_SECONDS = 5.0
+LIVE_INVENTORY_LIGHTER_RECOVERY_MIN_OUTAGE_SECONDS = 60.0
+LIVE_INVENTORY_LIGHTER_RECOVERY_MAX_SECONDS = 1200.0
+LIVE_INVENTORY_LIGHTER_RECOVERY_MAX_BASIS_DEVIATION_BPS = Decimal("20")
+LIVE_INVENTORY_LIGHTER_RECOVERY_CONFIRM_SAMPLES = 3
+LIVE_INVENTORY_LIGHTER_RECOVERY_CONFIRM_SECONDS = 30.0
 # An automatic rollback is safe to rearm only after both venue APIs confirm
 # the post-rollback position. The bounded retry covers exchange settlement
 # lag without turning a transient mismatch into a permanent manual stop.
@@ -518,6 +523,10 @@ def account_risk_context(
 ) -> dict[str, Any]:
     var_equity = to_decimal(variational_metrics.get("equity_usd"))
     lighter_equity = to_decimal(lighter_metrics.get("equity_usd"))
+    variational_balance = to_decimal(variational_metrics.get("balance_usd"))
+    variational_upnl = to_decimal(variational_metrics.get("upnl_usd"))
+    lighter_collateral = to_decimal(lighter_metrics.get("collateral_usd"))
+    lighter_upnl = to_decimal(lighter_metrics.get("unrealized_pnl_usd"))
     var_maintenance = to_decimal(
         variational_metrics.get("maintenance_margin_usage_pct")
     )
@@ -707,7 +716,22 @@ def account_risk_context(
         "variational_equity_formula": variational_metrics.get(
             "equity_formula"
         ),
+        "variational_realized_balance_usd": decimal_to_str(
+            variational_balance - variational_upnl
+            if variational_balance is not None and variational_upnl is not None
+            else None
+        ),
         "lighter_equity_usd": decimal_to_str(lighter_equity),
+        "lighter_collateral_usd": decimal_to_str(lighter_collateral),
+        "lighter_unrealized_pnl_usd": decimal_to_str(lighter_upnl),
+        "lighter_realized_balance_usd": decimal_to_str(lighter_collateral),
+        "lighter_realized_balance_check_usd": decimal_to_str(
+            lighter_equity - lighter_collateral - lighter_upnl
+            if lighter_equity is not None
+            and lighter_collateral is not None
+            and lighter_upnl is not None
+            else None
+        ),
         "combined_equity_usd": decimal_to_str(
             var_equity + lighter_equity
             if var_equity is not None and lighter_equity is not None
@@ -1437,6 +1461,7 @@ def extract_lighter_account_metrics(payload: Any) -> dict[str, Decimal | str | N
             "available_balance_usd": None,
             "total_asset_value_usd": None,
             "equity_usd": None,
+            "unrealized_pnl_usd": None,
             "equity_formula": None,
             "initial_margin_requirement_usd": None,
             "maintenance_margin_requirement_usd": None,
@@ -1451,6 +1476,7 @@ def extract_lighter_account_metrics(payload: Any) -> dict[str, Decimal | str | N
             "available_balance_usd": None,
             "total_asset_value_usd": None,
             "equity_usd": None,
+            "unrealized_pnl_usd": None,
             "equity_formula": None,
             "initial_margin_requirement_usd": None,
             "maintenance_margin_requirement_usd": None,
@@ -1461,6 +1487,25 @@ def extract_lighter_account_metrics(payload: Any) -> dict[str, Decimal | str | N
     available = to_decimal(account.get("available_balance"))
     total_asset_value = to_decimal(account.get("total_asset_value"))
     equity = total_asset_value if total_asset_value is not None else collateral
+    positions = account.get("positions")
+    position_upnl_values = [
+        to_decimal(position.get("unrealized_pnl"))
+        for position in positions
+        if isinstance(position, dict)
+    ] if isinstance(positions, list) else []
+    position_upnl = (
+        sum(position_upnl_values, Decimal("0"))
+        if isinstance(positions, list)
+        and all(value is not None for value in position_upnl_values)
+        else None
+    )
+    unrealized_pnl = position_upnl
+    if (
+        unrealized_pnl is None
+        and total_asset_value is not None
+        and collateral is not None
+    ):
+        unrealized_pnl = total_asset_value - collateral
     initial_margin = to_decimal(account.get("cross_initial_margin_requirement"))
     maintenance_margin = to_decimal(
         account.get("cross_maintenance_margin_requirement")
@@ -1470,6 +1515,7 @@ def extract_lighter_account_metrics(payload: Any) -> dict[str, Decimal | str | N
         "available_balance_usd": available,
         "total_asset_value_usd": total_asset_value,
         "equity_usd": equity,
+        "unrealized_pnl_usd": unrealized_pnl,
         "equity_formula": (
             "total_asset_value"
             if total_asset_value is not None
@@ -2891,6 +2937,12 @@ class VariationalToLighterRuntime:
 
         self.last_variational_trade_event_at: str | None = None
         self.last_lighter_order_book_update_at: str | None = None
+        self.live_inventory_lighter_recovery_guard: dict[str, Any] = {
+            "state": "normal"
+        }
+        self.live_inventory_loss_review_required = False
+        self.live_inventory_loss_review_context: dict[str, Any] | None = None
+        self.live_inventory_lighter_last_good_mid_basis_bps: Decimal | None = None
         self.last_live_submit_monotonic_by_asset: dict[str, float] = {}
         self.live_inventory_var_reject_cooldown_until: dict[tuple[str, str], float] = {}
         self.live_inventory_var_reject_cooldown_seconds = 600.0
@@ -4584,6 +4636,21 @@ class VariationalToLighterRuntime:
         self.pending_live_inventory_var_fill_matches = restored_pending_matches
         open_lots = state.get("open_lots")
         self.live_inventory_open_lots = open_lots if isinstance(open_lots, list) else []
+        recovery_guard = state.get("lighter_recovery_guard")
+        self.live_inventory_lighter_recovery_guard = (
+            dict(recovery_guard)
+            if isinstance(recovery_guard, dict)
+            else {"state": "normal"}
+        )
+        self.live_inventory_loss_review_required = bool(
+            state.get("loss_review_required", False)
+        )
+        loss_review_context = state.get("loss_review_context")
+        self.live_inventory_loss_review_context = (
+            dict(loss_review_context)
+            if isinstance(loss_review_context, dict)
+            else None
+        )
         self.live_inventory_next_lot_id = int(state.get("next_lot_id") or 1)
         self.live_inventory_realized_pnl_usd = to_decimal(state.get("realized_pnl_usd")) or Decimal("0")
         self.live_inventory_completed_cycles = int(state.get("completed_cycles") or 0)
@@ -6248,6 +6315,16 @@ class VariationalToLighterRuntime:
             "open_lots_total": len(open_lots),
             "pending_actions_total": len(pending_actions),
             "expected_open_qty": decimal_to_str(expected_open_qty),
+            "lighter_recovery_guard_state": str(
+                getattr(self, "live_inventory_lighter_recovery_guard", {}).get(
+                    "state", "normal"
+                )
+            ),
+            "lighter_recovery_guard_reference_basis_bps": (
+                getattr(self, "live_inventory_lighter_recovery_guard", {}).get(
+                    "reference_basis_bps"
+                )
+            ),
             **context,
             **reference_feed,
         }
@@ -7018,6 +7095,9 @@ class VariationalToLighterRuntime:
                     to_decimal(
                         lighter_metrics.get("total_asset_value_usd")
                     )
+                ),
+                "lighter_unrealized_pnl_usd": decimal_to_str(
+                    to_decimal(lighter_metrics.get("unrealized_pnl_usd"))
                 ),
                 "lighter_equity_usd": decimal_to_str(lighter_equity),
                 "lighter_equity_formula": lighter_metrics.get(
@@ -7791,6 +7871,9 @@ class VariationalToLighterRuntime:
 
     async def persist_live_inventory_memory(self, *, reason: str) -> None:
         pending_actions = self.pending_live_inventory_actions_payload()
+        if not self.live_inventory_open_lots and not pending_actions:
+            self.live_inventory_loss_review_required = False
+            self.live_inventory_loss_review_context = None
         await self.write_live_inventory_state_async(
             {
                 "status": live_inventory_state_status(
@@ -7823,6 +7906,17 @@ class VariationalToLighterRuntime:
                         "live_inventory_maintenance_drain_requested_at",
                         None,
                     )
+                ),
+                "lighter_recovery_guard": getattr(
+                    self,
+                    "live_inventory_lighter_recovery_guard",
+                    {"state": "normal"},
+                ),
+                "loss_review_required": bool(
+                    getattr(self, "live_inventory_loss_review_required", False)
+                ),
+                "loss_review_context": getattr(
+                    self, "live_inventory_loss_review_context", None
                 ),
                 **self.live_inventory_v4_episode_payload(),
                 "v4_shadow_tranche": getattr(
@@ -14080,6 +14174,8 @@ class VariationalToLighterRuntime:
             self.record_order.clear()
             self.lighter_client_order_to_trade_key.clear()
         self.cross_spread_history.clear()
+        self.live_inventory_lighter_recovery_guard = {"state": "normal"}
+        self.live_inventory_lighter_last_good_mid_basis_bps = None
         self.live_inventory_basis_reversion_history.clear()
         self.paper_position = None
         self.auto_live_position = None
@@ -16022,6 +16118,41 @@ class VariationalToLighterRuntime:
             except asyncio.CancelledError:
                 return
             except Exception as exc:
+                if self.is_live_inventory_enabled():
+                    recovery_guard = getattr(
+                        self, "live_inventory_lighter_recovery_guard", None
+                    )
+                    if not isinstance(recovery_guard, dict):
+                        recovery_guard = {"state": "normal"}
+                        self.live_inventory_lighter_recovery_guard = recovery_guard
+                    if recovery_guard.get("state") == "normal":
+                        recovery_guard = {
+                            "state": "outage",
+                            "outage_started_at": utc_now(),
+                            "reference_basis_bps": decimal_to_str(
+                                getattr(
+                                    self,
+                                    "live_inventory_lighter_last_good_mid_basis_bps",
+                                    None,
+                                )
+                            ),
+                        }
+                        self.live_inventory_lighter_recovery_guard = recovery_guard
+                        with contextlib.suppress(Exception):
+                            await self.append_live_inventory_log(
+                                "live_inventory_lighter_feed_outage",
+                                {
+                                    "asset": self.live_inventory_state_asset(),
+                                    "outage_started_at": recovery_guard[
+                                        "outage_started_at"
+                                    ],
+                                    "error": f"{type(exc).__name__}:{exc}",
+                                },
+                            )
+                        with contextlib.suppress(Exception):
+                            await self.persist_live_inventory_memory(
+                                reason="lighter_feed_outage_guard_started"
+                            )
                 self.logger.warning(
                     "Lighter websocket reconnect after error: %s (url=%s)",
                     exc,
@@ -18141,6 +18272,162 @@ class VariationalToLighterRuntime:
             if row[0] >= cutoff and row[value_index] is not None
         )
 
+    @staticmethod
+    def _cross_mid_basis_bps(snapshot: CrossSpreadSnapshot) -> Decimal | None:
+        if snapshot.var_mid <= 0:
+            return None
+        return (snapshot.lighter_mid / snapshot.var_mid - Decimal("1")) * Decimal(
+            "10000"
+        )
+
+    async def update_lighter_recovery_guard(
+        self, snapshot: CrossSpreadSnapshot
+    ) -> None:
+        guard = getattr(self, "live_inventory_lighter_recovery_guard", None)
+        if not isinstance(guard, dict):
+            guard = {"state": "normal"}
+            self.live_inventory_lighter_recovery_guard = guard
+        state = str(guard.get("state") or "normal")
+        basis_bps = self._cross_mid_basis_bps(snapshot)
+        now = datetime.now(timezone.utc)
+        now_iso = now.isoformat()
+
+        if state == "outage":
+            outage_age = self._age_seconds_from_iso(
+                str(guard.get("outage_started_at") or "")
+            )
+            if (
+                outage_age is None
+                or outage_age < LIVE_INVENTORY_LIGHTER_RECOVERY_MIN_OUTAGE_SECONDS
+            ):
+                self.live_inventory_lighter_recovery_guard = {"state": "normal"}
+                self.live_inventory_lighter_last_good_mid_basis_bps = basis_bps
+                with contextlib.suppress(Exception):
+                    await self.persist_live_inventory_memory(
+                        reason="lighter_feed_short_disconnect_recovered"
+                    )
+                return
+            guard.update(
+                {
+                    "state": "recovery",
+                    "recovery_started_at": now_iso,
+                    "last_processed_book_update_at": None,
+                    "converged_samples": 0,
+                    "converged_since_at": None,
+                }
+            )
+            if guard.get("reference_basis_bps") is None:
+                guard["reference_basis_bps"] = decimal_to_str(
+                    self.live_inventory_lighter_last_good_mid_basis_bps
+                )
+            self.live_inventory_lighter_recovery_guard = guard
+            with contextlib.suppress(Exception):
+                await self.append_live_inventory_log(
+                    "live_inventory_lighter_recovery_guard",
+                    {
+                        "asset": snapshot.asset,
+                        "state": "recovery",
+                        "outage_seconds": outage_age,
+                        "reference_basis_bps": guard.get("reference_basis_bps"),
+                        "current_basis_bps": decimal_to_str(basis_bps),
+                    },
+                )
+            with contextlib.suppress(Exception):
+                await self.persist_live_inventory_memory(
+                    reason="lighter_feed_recovery_guard_started"
+                )
+            state = "recovery"
+        elif state not in {"recovery", "expired"}:
+            self.live_inventory_lighter_last_good_mid_basis_bps = basis_bps
+            return
+
+        if state == "recovery":
+            recovery_age = self._age_seconds_from_iso(
+                str(guard.get("recovery_started_at") or "")
+            )
+            if (
+                recovery_age is not None
+                and recovery_age >= LIVE_INVENTORY_LIGHTER_RECOVERY_MAX_SECONDS
+            ):
+                guard["state"] = "expired"
+                self.live_inventory_lighter_recovery_guard = guard
+                with contextlib.suppress(Exception):
+                    await self.append_live_inventory_log(
+                        "live_inventory_lighter_recovery_guard_expired",
+                        {
+                            "asset": snapshot.asset,
+                            "recovery_seconds": recovery_age,
+                            "reference_basis_bps": guard.get(
+                                "reference_basis_bps"
+                            ),
+                            "current_basis_bps": decimal_to_str(basis_bps),
+                            "action": "loss_review_alert_only_entries_remain_blocked",
+                        },
+                    )
+                with contextlib.suppress(Exception):
+                    await self.persist_live_inventory_memory(
+                        reason="lighter_feed_recovery_guard_expired"
+                    )
+                state = "expired"
+
+        reference_basis = to_decimal(guard.get("reference_basis_bps"))
+        deviation = (
+            abs(basis_bps - reference_basis)
+            if basis_bps is not None and reference_basis is not None
+            else None
+        )
+        book_update_at = self.last_lighter_order_book_update_at
+        if book_update_at and book_update_at != guard.get(
+            "last_processed_book_update_at"
+        ):
+            guard["last_processed_book_update_at"] = book_update_at
+            if (
+                deviation is not None
+                and deviation
+                <= LIVE_INVENTORY_LIGHTER_RECOVERY_MAX_BASIS_DEVIATION_BPS
+            ):
+                if int(guard.get("converged_samples") or 0) == 0:
+                    guard["converged_since_at"] = now_iso
+                guard["converged_samples"] = int(
+                    guard.get("converged_samples") or 0
+                ) + 1
+            else:
+                guard["converged_samples"] = 0
+                guard["converged_since_at"] = None
+
+        converged_age = self._age_seconds_from_iso(
+            str(guard.get("converged_since_at") or "")
+        )
+        if (
+            int(guard.get("converged_samples") or 0)
+            >= LIVE_INVENTORY_LIGHTER_RECOVERY_CONFIRM_SAMPLES
+            and converged_age is not None
+            and converged_age >= LIVE_INVENTORY_LIGHTER_RECOVERY_CONFIRM_SECONDS
+        ):
+            self.live_inventory_lighter_recovery_guard = {"state": "normal"}
+            self.live_inventory_lighter_last_good_mid_basis_bps = basis_bps
+            with contextlib.suppress(Exception):
+                await self.append_live_inventory_log(
+                    "live_inventory_lighter_recovery_guard_cleared",
+                    {
+                        "asset": snapshot.asset,
+                        "reference_basis_bps": decimal_to_str(reference_basis),
+                        "current_basis_bps": decimal_to_str(basis_bps),
+                        "deviation_bps": decimal_to_str(deviation),
+                        "confirmation_samples": LIVE_INVENTORY_LIGHTER_RECOVERY_CONFIRM_SAMPLES,
+                    },
+                )
+            with contextlib.suppress(Exception):
+                await self.persist_live_inventory_memory(
+                    reason="lighter_feed_recovery_guard_cleared"
+                )
+            return
+        self.live_inventory_lighter_recovery_guard = guard
+
+    def lighter_recovery_entries_blocked(self) -> bool:
+        guard = getattr(self, "live_inventory_lighter_recovery_guard", None)
+        return isinstance(guard, dict) and guard.get("state") != "normal"
+
     async def get_raw_cross_spreads(self) -> tuple[Decimal | None, Decimal | None]:
         quote = await self.get_variational_quote(self.variational_ticker)
         lighter_bid, lighter_ask = await self.get_lighter_best_bid_ask()
@@ -18334,7 +18621,7 @@ class VariationalToLighterRuntime:
 
         raw = quote.get("raw") if isinstance(quote.get("raw"), dict) else {}
 
-        return CrossSpreadSnapshot(
+        snapshot = CrossSpreadSnapshot(
             asset=asset,
             var_bid=var_bid,
             var_ask=var_ask,
@@ -18362,6 +18649,8 @@ class VariationalToLighterRuntime:
             long_sample_count_5m=long_count,
             short_sample_count_5m=short_count,
         )
+        await self.update_lighter_recovery_guard(snapshot)
+        return snapshot
 
     async def log_live_inventory_snapshot_unavailable(self, reason: str, **context: Any) -> None:
         if not self.is_live_inventory_enabled():
@@ -19867,6 +20156,8 @@ class VariationalToLighterRuntime:
                 "live_inventory_maintenance_drain_requested",
                 False,
             )
+            and not self.lighter_recovery_entries_blocked()
+            and not getattr(self, "live_inventory_loss_review_required", False)
             and (
                 not self.live_inventory_open_lots
                 or addon_direction is not None
@@ -23144,7 +23435,40 @@ class VariationalToLighterRuntime:
             )
             raw_should_exit = raw_should_exit or should_profit_take
             should_exit = raw_should_exit and var_quote_age_ok and lighter_book_age_ok
-            should_stop = pnl_bps is not None and pnl_bps <= -self.live_inventory_max_unrealized_loss_bps
+            stop_threshold_hit = (
+                pnl_bps is not None
+                and pnl_bps <= -self.live_inventory_max_unrealized_loss_bps
+            )
+            should_stop = False
+            if stop_threshold_hit and not getattr(
+                self, "live_inventory_loss_review_required", False
+            ):
+                review_context = {
+                    "triggered_at": utc_now(),
+                    "lot_id": candidate_lot.get("lot_id"),
+                    "direction": direction,
+                    "pnl_bps": decimal_to_str(pnl_bps),
+                    "threshold_bps": decimal_to_str(
+                        -self.live_inventory_max_unrealized_loss_bps
+                    ),
+                }
+                self.live_inventory_loss_review_required = True
+                self.live_inventory_loss_review_context = review_context
+                with contextlib.suppress(Exception):
+                    await self.persist_live_inventory_memory(
+                        reason="max_unrealized_loss_requires_manual_review"
+                    )
+                await self.append_live_inventory_log(
+                    "live_inventory_loss_review_alert",
+                    {
+                        **state_payload,
+                        **review_context,
+                        "asset": asset,
+                        "reason": "max_unrealized_loss_manual_review",
+                        "open_lots_total": len(self.live_inventory_open_lots),
+                        "action": "block_new_entries_keep_existing_positions_under_normal_exit_management",
+                    },
+                )
             account_risk_exit_reason = getattr(
                 self, "live_inventory_account_risk_exit_reason", None
             )
@@ -23220,8 +23544,7 @@ class VariationalToLighterRuntime:
                                 "quote_source": quote.get("quote_source"),
                             },
                         )
-                # V4 has no time-driven exit or target relaxation. Account risk,
-                # executable profit, and the independent loss fuse are the only exits.
+                # V4 exits on account risk or confirmed executable profit only.
                 should_timeout = False
                 should_timeout_exit = False
                 if (

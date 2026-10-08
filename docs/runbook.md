@@ -513,28 +513,51 @@ is documented in `docs/risk_wakeup_watchdog.md`. It reads local state and the
 main runtime's small risk heartbeat only; it never enters the quote or order
 path.
 
-# Account Equity Var/RH PnL
+# RH recovery after a market-data outage
 
-The daily Telegram report uses the combined fresh equity snapshots from both
-venues. Equity change includes settled funding and unrealized PnL, so it is an
-account-return measure rather than realized-only PnL. It also reflects manual
-trades. Registered deposits and withdrawals are deducted from the return and
-adjust the capital denominator. The statistics period starts on 2026-10-05;
-its starting capital is taken from the first saved two-venue equity sample on
-that Beijing date, not from an earlier baseline.
+When the RH order-book WebSocket disconnects for at least 60 seconds, live
+inventory mode saves a recovery guard. While the recovered RH/Var mid-price
+basis remains more than 20 bps from its pre-outage value, the guard blocks new
+entries. Three fresh, converged samples spanning at least 30 seconds clear the
+guard; otherwise entries remain blocked. Account-risk emergency exits remain
+active throughout.
 
-Daily reports require the strategy to be running so the five-minute systemd
-timer can save fresh equity snapshots. A day is marked partial if boundary
-coverage or continuity is insufficient. If no starting-day equity sample is
-available, cumulative return and capital are withheld rather than falling
-back to the old 2026-09-26 baseline. Equity snapshots alone cannot identify
-unregistered deposits or withdrawals; record those through the existing
-cashflow ledger when they occur.
+The configured 50 bps unrealized-loss threshold is now a manual-review alert,
+not an automatic close. It sends one Telegram alert, persists a review latch,
+and blocks new entries/add-ons while existing lots continue under their normal
+exit rules. The latch clears when all lots and pending actions are gone.
 
-The optional realized-activity report remains available for separate
-reconciliation. It counts exchange-reported trades and settled funding, and
-requires Var CSV exports plus a coverage attestation. That report is separate
-from the daily account-equity Telegram report.
+# Account PnL Var/RH
+
+The ETH daily Telegram report measures the change in realized account balances:
+Variational balance less its reported unrealized PnL, plus RH collateral after
+checking it against RH total asset value and unrealized PnL. Open-position PnL
+is excluded until it is realized. The report also reflects manual trades.
+Registered deposits and withdrawals are deducted from returns and adjust the
+capital denominator.
+
+The cumulative start is stored in
+`log/account_equity_daily_state.json` under `realized_tracking`. To reset it,
+the strategy must be publishing a fresh, complete two-venue snapshot with no
+pending actions. Preview first, then apply; applying backs up the state file,
+starts cumulative PnL and trade volume at that snapshot, and retains daily
+history:
+
+```bash
+python tools/daily_pnl_report.py --asset ETH --reset-cumulative-baseline
+python tools/daily_pnl_report.py --asset ETH --reset-cumulative-baseline \
+  --apply-cumulative-reset
+```
+
+Daily reports use the five-minute timer's account snapshots to maintain daily
+realized-balance samples. A day is marked partial if boundary coverage or
+sample continuity is insufficient. Snapshots cannot identify unregistered
+deposits or withdrawals; record those through the cashflow ledger when they
+occur.
+
+The optional platform-activity report remains available for reconciliation. It
+counts exchange-reported trades and settled funding, and requires Var CSV
+exports plus a coverage attestation.
 
 After exporting and checking the full Var history, the optional report's
 coverage attestation can be created locally:

@@ -8,7 +8,7 @@ Type=oneshot
 User=ubuntu
 WorkingDirectory=/home/ubuntu/var-rh-eth
 EnvironmentFile=-/home/ubuntu/var-rh-eth/.env
-ExecStart=/home/ubuntu/var-rh-eth/.venv/bin/python tools/daily_pnl_report.py --asset ETH
+ExecStart=/home/ubuntu/var-rh-eth/.venv/bin/python tools/daily_pnl_report.py --asset ETH --sync-platform-data
 
 [Install]
 WantedBy=multi-user.target

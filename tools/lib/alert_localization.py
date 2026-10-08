@@ -105,6 +105,7 @@ REASON_LABELS = {
     "basis_signal_exit_watch_waiting_for_pnl": "平仓信号已出现，等待达到最低收益",
     "entry_final_fill_cost_pending": "等待开仓最终成交成本确认",
     "max_unrealized_loss_bps": "触发最大未实现亏损保护",
+    "max_unrealized_loss_manual_review": "未实现亏损达到人工审核阈值",
     "v4_max_hold_timeout": "旧版最长持仓超时",
     "operator_requested_exit": "人工请求安全退出",
     "operator_requested_atomic_exit_locked": "人工退出请求已锁定，等待双边处理",
