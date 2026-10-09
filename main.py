@@ -14,7 +14,7 @@ import time
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP, ROUND_UP
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -1929,6 +1929,11 @@ class OrderLifecycle:
             "live_plan_ready_at": self.live_plan_ready_at_iso,
             "live_submit_started_at": self.live_submit_started_at_iso,
             "live_submit_wire_sent_at": self.live_submit_wire_sent_at_iso,
+            "live_submit_wire_timestamp_source": (
+                "local_websocket_send_completion_backprojected"
+                if self.live_submit_wire_sent_monotonic is not None
+                else None
+            ),
             "live_submit_sent_at": self.live_submit_sent_at_iso,
             "live_var_seen_to_plan_start_ms": decimal_to_str(elapsed_ms(
                 self.live_var_fill_seen_monotonic,
@@ -14371,7 +14376,9 @@ class VariationalToLighterRuntime:
                     "record_kind": "execution_lifecycle_timing",
                     "trade_key": payload.get("trade_key"),
                     "trade_id": payload.get("trade_id"),
+                    "mode": payload.get("mode"),
                     "asset": payload.get("asset"),
+                    "auto_live_cycle_id": payload.get("auto_live_cycle_id"),
                     "side": payload.get("side"),
                     "qty": payload.get("qty"),
                     "auto_live_role": payload.get("auto_live_role"),
@@ -14380,6 +14387,10 @@ class VariationalToLighterRuntime:
                     "lighter_reduce_only": payload.get("lighter_reduce_only"),
                     "lighter_filled_price": payload.get("lighter_filled_price"),
                     "lighter_filled_base_amount": payload.get("lighter_filled_base_amount"),
+                    "live_submit_wire_sent_at": payload.get("live_submit_wire_sent_at"),
+                    "live_submit_wire_timestamp_source": payload.get(
+                        "live_submit_wire_timestamp_source"
+                    ),
                     "live_submit_call_latency_ms": payload.get("live_submit_call_latency_ms"),
                     "live_submit_start_to_wire_sent_ms": payload.get("live_submit_start_to_wire_sent_ms"),
                     "live_wire_sent_to_submit_ack_ms": payload.get("live_wire_sent_to_submit_ack_ms"),
@@ -17715,7 +17726,13 @@ class VariationalToLighterRuntime:
                 record.lighter_tx_hash = tx_hash
                 if wire_sent_monotonic is not None:
                     record.live_submit_wire_sent_monotonic = wire_sent_monotonic
-                    record.live_submit_wire_sent_at_iso = utc_now()
+                    wire_elapsed_seconds = max(
+                        0.0, time.monotonic() - wire_sent_monotonic
+                    )
+                    record.live_submit_wire_sent_at_iso = (
+                        datetime.now(timezone.utc)
+                        - timedelta(seconds=wire_elapsed_seconds)
+                    ).isoformat()
                 record.live_submit_sent_at_iso = submit_sent_iso
                 record.live_submit_sent_monotonic = submit_sent_monotonic
                 record.hedge_error = None

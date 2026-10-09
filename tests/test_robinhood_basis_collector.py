@@ -104,6 +104,7 @@ def test_collector_builds_depth_ladder_without_credentials(tmp_path) -> None:
         assert error is None
         assert row is not None
         assert row["event"] == "robinhood_lighter_basis_state"
+        assert row["venue"] == "robinhood_chain_lighter"
         assert row["robinhood_lighter_market_id"] == 0
         assert row["robinhood_lighter_primary_notional_usd"] == "20"
         assert row["source_sample_id"] == "source-1"
@@ -117,6 +118,113 @@ def test_collector_builds_depth_ladder_without_credentials(tmp_path) -> None:
         assert Decimal(row["short_edge_bps"]) > 0
 
     asyncio.run(run())
+
+
+def test_collector_infers_mainnet_venue_from_matching_endpoints(tmp_path) -> None:
+    args = parse_args(
+        [
+            "--source-root",
+            str(tmp_path / "source"),
+            "--output-dir",
+            str(tmp_path / "output"),
+            "--rest-url",
+            "https://mainnet.zklighter.elliot.ai/api/v1/orderBooks",
+            "--order-book-orders-url",
+            "https://mainnet.zklighter.elliot.ai/api/v1/orderBookOrders",
+        ]
+    )
+
+    assert args.venue == "mainnet_lighter"
+
+
+def test_mainnet_collector_row_has_venue_and_capture_timing_metadata(tmp_path) -> None:
+    async def run() -> None:
+        args = parse_args(
+            [
+                "--source-root",
+                str(tmp_path / "source"),
+                "--output-dir",
+                str(tmp_path / "output"),
+                "--rest-url",
+                "https://mainnet.zklighter.elliot.ai/api/v1/orderBooks",
+                "--order-book-orders-url",
+                "https://mainnet.zklighter.elliot.ai/api/v1/orderBookOrders",
+            ]
+        )
+        collector = RobinhoodBasisCollector(args)
+        collector.books.by_asset["ETH"] = SimpleNamespace(market_id=1)
+
+        async def fake_snapshot(_asset, notional, *, force_refresh=False):
+            return {
+                "bid": Decimal("1999.9"),
+                "ask": Decimal("2000.1"),
+                "sell_price": Decimal("1999.8") - notional / Decimal("10000"),
+                "buy_price": Decimal("2000.2") + notional / Decimal("10000"),
+                "nonce": 10,
+                "book_age_seconds": 0.1,
+                "continuity_ok": True,
+                "cold": False,
+                "sequence_gaps": 0,
+            }
+
+        collector.books.snapshot = fake_snapshot
+        now = datetime(2026, 8, 25, 0, 0, 1, tzinfo=timezone.utc)
+        row, error = await collector.build_row(
+            {
+                "event": "live_inventory_basis_state",
+                "sample_id": "source-mainnet-1",
+                "sample_kind": "baseline",
+                "sample_quality": "valid",
+                "sample_pair_valid": True,
+                "logged_at": "2026-08-25T00:00:00.900000+00:00",
+                "quote_received_at": "2026-08-25T00:00:00.800000+00:00",
+                "quote_size_mode": "market",
+                "var_quote_age_seconds": "0.1",
+                "asset": "ETH",
+                "run_id": "live-run",
+                "sample_index": 1,
+                "var_bid": "2001",
+                "var_ask": "2002",
+            },
+            now=now,
+        )
+
+        assert error is None
+        assert row is not None
+        assert row["event"] == "mainnet_lighter_basis_state"
+        assert row["venue"] == "mainnet_lighter"
+        assert row["mainnet_lighter_market_id"] == 1
+        assert row["source_sample_pair_valid"] is True
+        assert row["venue_capture_completed_at"] >= row["venue_capture_started_at"]
+        assert row["venue_book_received_at"] <= row["venue_capture_completed_at"]
+        assert row["venue_capture_duration_ms"] is not None
+
+    asyncio.run(run())
+
+
+def test_collector_rejects_venue_or_endpoint_host_mismatch(tmp_path) -> None:
+    import pytest
+
+    common = ["--source-root", str(tmp_path / "source"), "--output-dir", str(tmp_path / "output")]
+    with pytest.raises(SystemExit):
+        parse_args(
+            [
+                *common,
+                "--venue",
+                "mainnet_lighter",
+            ]
+        )
+
+    with pytest.raises(SystemExit):
+        parse_args(
+            [
+                *common,
+                "--rest-url",
+                "https://mainnet.zklighter.elliot.ai/api/v1/orderBooks",
+                "--order-book-orders-url",
+                "https://api.rh.lighter.xyz/api/v1/orderBookOrders",
+            ]
+        )
 
 
 def test_collector_builds_forced_trade_event_snapshot(tmp_path) -> None:

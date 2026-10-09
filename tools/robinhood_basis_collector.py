@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only Variational/Robinhood Lighter basis sidecar.
+"""Read-only Variational/Lighter basis sidecar.
 
 The sidecar consumes Variational quotes already persisted by the live process.
 It never connects to the Variational extension and never imports trading keys.
@@ -21,10 +21,11 @@ import sys
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
 
@@ -38,6 +39,10 @@ ROBINHOOD_LIGHTER_REST_URL = "https://api.rh.lighter.xyz/api/v1/orderBooks"
 ROBINHOOD_LIGHTER_ORDER_BOOK_URL = (
     "https://api.rh.lighter.xyz/api/v1/orderBookOrders"
 )
+LIGHTER_VENUE_HOSTS = {
+    "robinhood_chain_lighter": "api.rh.lighter.xyz",
+    "mainnet_lighter": "mainnet.zklighter.elliot.ai",
+}
 DEFAULT_NOTIONALS = (Decimal("20"), Decimal("40"), Decimal("60"))
 TRADE_EVENT_SNAPSHOT_EVENTS = {
     "live_inventory_entry_shadow_candidate",
@@ -96,6 +101,17 @@ def event_identity(row: dict[str, Any]) -> str:
             row.get("logged_at"),
         )
     )
+
+
+def infer_venue(rest_url: str, orders_url: str) -> str:
+    rest_host = (urlparse(rest_url).hostname or "").lower()
+    orders_host = (urlparse(orders_url).hostname or "").lower()
+    if rest_host != orders_host:
+        raise ValueError("market and order-book endpoints must use the same host")
+    for venue, host in LIGHTER_VENUE_HOSTS.items():
+        if rest_host == host:
+            return venue
+    raise ValueError(f"unsupported Lighter market-data host: {rest_host or '-'}")
 
 
 class FixedJsonlFollower:
@@ -246,7 +262,7 @@ class RobinhoodRestBooks:
             None,
         )
         if market is None:
-            raise RuntimeError(f"Robinhood Lighter market not found: {self.asset}")
+            raise RuntimeError(f"Lighter market not found: {self.asset}")
         self.by_asset[self.asset] = RestMarket(
             asset=self.asset,
             market_id=int(market["market_id"]),
@@ -315,7 +331,7 @@ class RobinhoodRestBooks:
             bids = self._levels(payload.get("bids", []))
             asks = self._levels(payload.get("asks", []))
             if not bids or not asks:
-                raise RuntimeError("Robinhood Lighter REST book is empty")
+                raise RuntimeError("Lighter REST book is empty")
             self.bids = bids
             self.asks = asks
             self.received_monotonic = time.monotonic()
@@ -338,7 +354,7 @@ class RobinhoodRestBooks:
                 last_error = exc
                 await asyncio.sleep(1.0)
         raise RuntimeError(
-            f"Timed out waiting for Robinhood Lighter REST book: {last_error}"
+            f"Timed out waiting for Lighter REST book: {last_error}"
         )
 
     async def snapshot(
@@ -386,13 +402,20 @@ class RobinhoodBasisCollector:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
         self.asset = args.asset
+        self.venue = args.venue
+        self.venue_prefix = (
+            "robinhood_lighter"
+            if self.venue == "robinhood_chain_lighter"
+            else "mainnet_lighter"
+        )
         self.notional_ladder = tuple(args.notional_ladder)
         self.primary_notional = self.notional_ladder[0]
         self.output_dir = Path(args.output_dir).resolve()
         self.sample_root = self.output_dir / "robinhood_basis_samples"
         self.health_path = self.output_dir / "robinhood_basis_health.json"
+        run_prefix = "rhbasis" if self.venue == "robinhood_chain_lighter" else "mainnetbasis"
         self.run_id = (
-            f"rhbasis-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}-"
+            f"{run_prefix}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}-"
             f"{uuid.uuid4().hex[:8]}"
         )
         self.stop = False
@@ -473,7 +496,8 @@ class RobinhoodBasisCollector:
             "updated_at": utc_now(),
             "run_id": self.run_id,
             "execution_mode": "collect_only",
-            "venue": "robinhood_chain_lighter",
+            "venue": self.venue,
+            "venue_rest_host": urlparse(self.args.rest_url).hostname,
             "asset": self.asset,
             "samples": self.samples,
             "baseline_samples": self.baseline_samples,
@@ -550,16 +574,19 @@ class RobinhoodBasisCollector:
                 force_refresh=force_refresh and index == 0,
             )
             if snapshot is None:
-                return None, "robinhood_lighter_book_unavailable"
+                return None, f"{self.venue_prefix}_book_unavailable"
             if snapshot.get("sell_price") is None or snapshot.get("buy_price") is None:
-                return None, f"robinhood_lighter_depth_insufficient_{decimal_text(notional)}"
+                return None, (
+                    f"{self.venue_prefix}_depth_insufficient_"
+                    f"{decimal_text(notional)}"
+                )
             snapshots[decimal_text(notional) or "0"] = snapshot
         primary = snapshots[decimal_text(self.primary_notional) or "0"]
         book_age = primary.get("book_age_seconds")
         if book_age is None or book_age > self.args.max_book_age_seconds:
-            return None, "robinhood_lighter_book_stale"
+            return None, f"{self.venue_prefix}_book_stale"
         if not primary.get("continuity_ok") or primary.get("cold"):
-            return None, "robinhood_lighter_book_not_continuous"
+            return None, f"{self.venue_prefix}_book_not_continuous"
         return snapshots, None
 
     async def build_row(
@@ -575,11 +602,20 @@ class RobinhoodBasisCollector:
         source_age = (now - source_time).total_seconds()
         if source_age < -1 or source_age > self.args.max_source_age_seconds:
             return None, "source_sample_stale"
+        capture_started_monotonic = time.monotonic()
         snapshots, snapshot_error = await self._book_snapshots(force_refresh=False)
         if snapshots is None:
             return None, snapshot_error
+        capture_elapsed_seconds = max(
+            0.0, time.monotonic() - capture_started_monotonic
+        )
+        capture_completed_at = now + timedelta(seconds=capture_elapsed_seconds)
+        source_age += capture_elapsed_seconds
+        if source_age > self.args.max_source_age_seconds:
+            return None, "source_sample_stale_at_capture"
         primary = snapshots[decimal_text(self.primary_notional) or "0"]
         book_age = primary.get("book_age_seconds")
+        book_received_at = capture_completed_at - timedelta(seconds=float(book_age))
         var_bid = Decimal(str(source["var_bid"]))
         var_ask = Decimal(str(source["var_ask"]))
         normalized_var_bid = source.get("normalized_var_bid")
@@ -607,17 +643,25 @@ class RobinhoodBasisCollector:
         lighter_buy = primary["buy_price"]
         lighter_sell = primary["sell_price"]
         row = {
-            "event": "robinhood_lighter_basis_state",
-            "logged_at": now.isoformat(),
+            "event": (
+                "robinhood_lighter_basis_state"
+                if self.venue == "robinhood_chain_lighter"
+                else "mainnet_lighter_basis_state"
+            ),
+            "logged_at": capture_completed_at.isoformat(),
+            "venue_capture_started_at": now.isoformat(),
+            "venue_capture_completed_at": capture_completed_at.isoformat(),
+            "venue_book_received_at": book_received_at.isoformat(),
+            "venue_capture_duration_ms": f"{capture_elapsed_seconds * 1000:.3f}",
             "sample_id": uuid.uuid4().hex,
             "sample_kind": "baseline",
             "sample_quality": "valid",
             "record_kind": "basis_market_sample",
             "execution_mode": "collect_only",
             "run_id": self.run_id,
-            "strategy_version": "robinhood-lighter-basis-sidecar-v2",
+            "strategy_version": "lighter-basis-sidecar-v3",
             "asset": self.asset,
-            "venue": "robinhood_chain_lighter",
+            "venue": self.venue,
             "source_sample_id": source_identity(source),
             "source_run_id": source.get("run_id"),
             "source_logged_at": source.get("logged_at"),
@@ -636,22 +680,33 @@ class RobinhoodBasisCollector:
             "var_ask": decimal_text(var_ask),
             "normalized_var_bid": normalized_var_bid,
             "normalized_var_ask": normalized_var_ask,
-            "robinhood_lighter_market_id": self.books.by_asset[self.asset].market_id,
-            "robinhood_lighter_primary_notional_usd": decimal_text(
-                self.primary_notional
-            ),
-            "robinhood_lighter_bid": decimal_text(lighter_bid),
-            "robinhood_lighter_ask": decimal_text(lighter_ask),
-            "robinhood_lighter_buy_price": decimal_text(lighter_buy),
-            "robinhood_lighter_sell_price": decimal_text(lighter_sell),
-            "robinhood_lighter_spread_bps": decimal_text(
+            "lighter_market_id": self.books.by_asset[self.asset].market_id,
+            "lighter_primary_notional_usd": decimal_text(self.primary_notional),
+            "lighter_bid": decimal_text(lighter_bid),
+            "lighter_ask": decimal_text(lighter_ask),
+            "lighter_buy_price": decimal_text(lighter_buy),
+            "lighter_sell_price": decimal_text(lighter_sell),
+            "lighter_spread_bps": decimal_text(
                 spread_bps(lighter_bid, lighter_ask)
             ),
-            "robinhood_lighter_book_age_seconds": f"{book_age:.6f}",
-            "robinhood_lighter_nonce": primary.get("nonce"),
-            "robinhood_lighter_sequence_gaps": primary.get("sequence_gaps"),
-            "robinhood_lighter_continuity_ok": primary.get("continuity_ok"),
-            "robinhood_lighter_market_data_transport": primary.get("transport"),
+            "lighter_book_age_seconds": f"{book_age:.6f}",
+            "lighter_market_data_transport": primary.get("transport"),
+            f"{self.venue_prefix}_market_id": self.books.by_asset[self.asset].market_id,
+            f"{self.venue_prefix}_primary_notional_usd": decimal_text(
+                self.primary_notional
+            ),
+            f"{self.venue_prefix}_bid": decimal_text(lighter_bid),
+            f"{self.venue_prefix}_ask": decimal_text(lighter_ask),
+            f"{self.venue_prefix}_buy_price": decimal_text(lighter_buy),
+            f"{self.venue_prefix}_sell_price": decimal_text(lighter_sell),
+            f"{self.venue_prefix}_spread_bps": decimal_text(
+                spread_bps(lighter_bid, lighter_ask)
+            ),
+            f"{self.venue_prefix}_book_age_seconds": f"{book_age:.6f}",
+            f"{self.venue_prefix}_nonce": primary.get("nonce"),
+            f"{self.venue_prefix}_sequence_gaps": primary.get("sequence_gaps"),
+            f"{self.venue_prefix}_continuity_ok": primary.get("continuity_ok"),
+            f"{self.venue_prefix}_market_data_transport": primary.get("transport"),
             "basis_bps": decimal_text(
                 ((var_bid + var_ask) / Decimal("2") - (lighter_bid + lighter_ask) / Decimal("2"))
                 / ((lighter_bid + lighter_ask) / Decimal("2"))
@@ -688,10 +743,21 @@ class RobinhoodBasisCollector:
         source_age = (now - source_time).total_seconds()
         if source_age < -1 or source_age > self.args.max_event_age_seconds:
             return None, "trade_event_stale"
+        capture_started_monotonic = time.monotonic()
         snapshots, snapshot_error = await self._book_snapshots(force_refresh=True)
         if snapshots is None:
             return None, snapshot_error
+        capture_elapsed_seconds = max(
+            0.0, time.monotonic() - capture_started_monotonic
+        )
+        capture_completed_at = now + timedelta(seconds=capture_elapsed_seconds)
+        source_age += capture_elapsed_seconds
+        if source_age > self.args.max_event_age_seconds:
+            return None, "trade_event_stale_at_capture"
         primary = snapshots[decimal_text(self.primary_notional) or "0"]
+        book_received_at = capture_completed_at - timedelta(
+            seconds=float(primary["book_age_seconds"])
+        )
         var_bid = self._first_decimal(
             source,
             ("var_bid", "entry_var_price", "final_var_fill_price", "exit_var_price"),
@@ -699,6 +765,9 @@ class RobinhoodBasisCollector:
         var_ask = self._first_decimal(
             source,
             ("var_ask", "exit_var_price", "final_var_fill_price", "entry_var_price"),
+        )
+        source_qty = self._first_decimal(
+            source, ("qty", "quantity", "lot_qty", "final_qty")
         )
         ladder: list[dict[str, Any]] = []
         for notional in self.notional_ladder:
@@ -727,23 +796,34 @@ class RobinhoodBasisCollector:
         lighter_buy = primary["buy_price"]
         lighter_sell = primary["sell_price"]
         return {
-            "event": "robinhood_lighter_trade_event_snapshot",
-            "logged_at": now.isoformat(),
+            "event": (
+                "robinhood_lighter_trade_event_snapshot"
+                if self.venue == "robinhood_chain_lighter"
+                else "mainnet_lighter_trade_event_snapshot"
+            ),
+            "logged_at": capture_completed_at.isoformat(),
+            "venue_capture_started_at": now.isoformat(),
+            "venue_capture_completed_at": capture_completed_at.isoformat(),
+            "venue_book_received_at": book_received_at.isoformat(),
+            "venue_capture_duration_ms": f"{capture_elapsed_seconds * 1000:.3f}",
             "sample_id": uuid.uuid4().hex,
             "sample_kind": "trade_event",
             "sample_quality": "valid",
             "record_kind": "basis_market_sample",
             "execution_mode": "collect_only",
             "run_id": self.run_id,
-            "strategy_version": "robinhood-lighter-basis-sidecar-v2",
+            "strategy_version": "lighter-basis-sidecar-v3",
             "asset": self.asset,
-            "venue": "robinhood_chain_lighter",
+            "venue": self.venue,
             "source_event_id": event_identity(source),
             "source_event": source.get("event"),
             "source_run_id": source.get("run_id"),
             "source_logged_at": source.get("logged_at"),
             "source_event_age_seconds": f"{source_age:.6f}",
             "source_lot_id": source.get("lot_id"),
+            "source_qty": (
+                decimal_text(source_qty)
+            ),
             "source_episode_id": source.get("episode_id"),
             "source_direction": source.get("direction"),
             "source_edge_bps": source.get("edge_bps") or source.get("entry_edge_bps"),
@@ -751,16 +831,36 @@ class RobinhoodBasisCollector:
             "source_exit_confirmation_mode": source.get("exit_confirmation_mode"),
             "var_bid": decimal_text(var_bid),
             "var_ask": decimal_text(var_ask),
-            "robinhood_lighter_market_id": self.books.by_asset[self.asset].market_id,
-            "robinhood_lighter_bid": decimal_text(lighter_bid),
-            "robinhood_lighter_ask": decimal_text(lighter_ask),
-            "robinhood_lighter_buy_price": decimal_text(lighter_buy),
-            "robinhood_lighter_sell_price": decimal_text(lighter_sell),
-            "robinhood_lighter_spread_bps": decimal_text(
+            "lighter_market_id": self.books.by_asset[self.asset].market_id,
+            "lighter_bid": decimal_text(lighter_bid),
+            "lighter_ask": decimal_text(lighter_ask),
+            "lighter_buy_price": decimal_text(lighter_buy),
+            "lighter_sell_price": decimal_text(lighter_sell),
+            "lighter_spread_bps": decimal_text(
                 spread_bps(lighter_bid, lighter_ask)
             ),
-            "robinhood_lighter_book_age_seconds": f"{primary['book_age_seconds']:.6f}",
-            "robinhood_lighter_market_data_transport": primary.get("transport"),
+            "lighter_book_age_seconds": f"{primary['book_age_seconds']:.6f}",
+            "lighter_market_data_transport": primary.get("transport"),
+            "source_quote_notional_usd": (
+                decimal_text(
+                    source_qty
+                    * ((var_bid + var_ask) / Decimal("2"))
+                )
+                if source_qty is not None
+                and var_bid is not None
+                and var_ask is not None
+                else None
+            ),
+            f"{self.venue_prefix}_market_id": self.books.by_asset[self.asset].market_id,
+            f"{self.venue_prefix}_bid": decimal_text(lighter_bid),
+            f"{self.venue_prefix}_ask": decimal_text(lighter_ask),
+            f"{self.venue_prefix}_buy_price": decimal_text(lighter_buy),
+            f"{self.venue_prefix}_sell_price": decimal_text(lighter_sell),
+            f"{self.venue_prefix}_spread_bps": decimal_text(
+                spread_bps(lighter_bid, lighter_ask)
+            ),
+            f"{self.venue_prefix}_book_age_seconds": f"{primary['book_age_seconds']:.6f}",
+            f"{self.venue_prefix}_market_data_transport": primary.get("transport"),
             "basis_bps": (
                 decimal_text(
                     ((var_bid + var_ask) / Decimal("2") - (lighter_bid + lighter_ask) / Decimal("2"))
@@ -794,8 +894,9 @@ class RobinhoodBasisCollector:
                 self.follower.seek_to_end()
             self.event_follower.seek_to_end()
             self.logger.info(
-                "collector_started run_id=%s asset=%s source=%s notionals=%s",
+                "collector_started run_id=%s venue=%s asset=%s source=%s notionals=%s",
                 self.run_id,
+                self.venue,
                 self.asset,
                 self.follower.current_path(),
                 ",".join(decimal_text(value) or "0" for value in self.notional_ladder),
@@ -891,9 +992,15 @@ def parse_notional_ladder(value: str) -> tuple[Decimal, ...]:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Read-only Variational/Robinhood Chain Lighter basis sidecar."
+        description="Read-only Variational/Lighter basis sidecar."
     )
     parser.add_argument("--asset", default="ETH", choices=("ETH",))
+    parser.add_argument(
+        "--venue",
+        choices=("auto", *LIGHTER_VENUE_HOSTS),
+        default="auto",
+        help="Venue label inferred from the market-data endpoint when set to auto.",
+    )
     parser.add_argument("--source-root", default=str(ROOT / "log" / "basis_samples"))
     parser.add_argument("--output-dir", default=str(ROOT / "log"))
     parser.add_argument(
@@ -920,6 +1027,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Replay fresh rows from today's source file; default follows only new rows.",
     )
     args = parser.parse_args(argv)
+    try:
+        endpoint_venue = infer_venue(args.rest_url, args.order_book_orders_url)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if args.venue == "auto":
+        args.venue = endpoint_venue
+    elif args.venue != endpoint_venue:
+        parser.error(
+            f"venue {args.venue} does not match endpoint host "
+            f"{urlparse(args.rest_url).hostname}"
+        )
     if args.poll_interval_seconds <= 0 or args.health_interval_seconds <= 0:
         parser.error("poll and health intervals must be > 0")
     if (

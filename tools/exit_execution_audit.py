@@ -60,6 +60,7 @@ def audit_files(paths: list[Path], *, since: datetime, asset: str) -> dict[str, 
     refresh_numeric: Counter[str] = Counter()
     shadow_attempts: Counter[Decimal] = Counter()
     shadow_lots: dict[Decimal, set[tuple[str, str]]] = defaultdict(set)
+    execution_timings: list[dict[str, Any]] = []
     scanned_lines = oversized_lines = 0
 
     for path in paths:
@@ -85,6 +86,51 @@ def audit_files(paths: list[Path], *, since: datetime, asset: str) -> dict[str, 
                 if at is None or at < since:
                     continue
                 if str(row.get("asset") or "").upper() != asset:
+                    continue
+                if (
+                    row.get("event") == "lighter_fill_timing"
+                    and row.get("record_kind") == "execution_lifecycle_timing"
+                ):
+                    if row.get("mode") != "live":
+                        continue
+                    role = str(row.get("auto_live_role") or "other")
+                    phase = (
+                        "exit"
+                        if row.get("lighter_reduce_only") is True
+                        or "exit" in role
+                        else "entry"
+                        if role != "other"
+                        else "other"
+                    )
+                    execution_timings.append(
+                        {
+                            "logged_at": row.get("logged_at"),
+                            "cycle_id": row.get("auto_live_cycle_id"),
+                            "trade_key": row.get("trade_key"),
+                            "phase": phase,
+                            "role": role,
+                            "side": row.get("lighter_order_side"),
+                            "qty": decimal(row.get("qty")),
+                            "fill_price": decimal(row.get("lighter_filled_price")),
+                            "wire_at": row.get("live_submit_wire_sent_at"),
+                            "wire_time_source": row.get(
+                                "live_submit_wire_timestamp_source"
+                            ),
+                            "plan_latency_ms": decimal(row.get("live_plan_latency_ms")),
+                            "plan_to_submit_ms": decimal(
+                                row.get("live_plan_ready_to_submit_start_ms")
+                            ),
+                            "start_to_wire_ms": decimal(
+                                row.get("live_submit_start_to_wire_sent_ms")
+                            ),
+                            "wire_to_fill_callback_ms": decimal(
+                                row.get("live_wire_sent_to_fill_ms")
+                            ),
+                            "wire_to_ack_ms": decimal(
+                                row.get("live_wire_sent_to_submit_ack_ms")
+                            ),
+                        }
+                    )
                     continue
                 if not str(row.get("strategy_version") or "").startswith("basis-v4-live"):
                     continue
@@ -173,6 +219,7 @@ def audit_files(paths: list[Path], *, since: datetime, asset: str) -> dict[str, 
         "refresh_numeric": refresh_numeric,
         "shadow_attempts": shadow_attempts,
         "shadow_lots": {target: len(keys) for target, keys in shadow_lots.items()},
+        "execution_timings": execution_timings,
     }
 
 
@@ -214,6 +261,34 @@ def main() -> int:
     for reason in sorted(REFRESH_REASONS):
         print(f"refresh_block reason={reason} logged_blocks={result['refresh_counts'][reason]} distinct_lots={result['refresh_lots'].get(reason, 0)}")
     print(f"refresh_numeric={dict(result['refresh_numeric'])}")
+    timing_rows = result["execution_timings"]
+    timing_source_counts = Counter(
+        row["wire_time_source"] or "legacy_or_missing" for row in timing_rows
+    )
+    print(
+        f"lighter_fill_timings={len(timing_rows)} "
+        f"wire_timestamp_sources={dict(timing_source_counts)}"
+    )
+    for phase in ("entry", "exit", "other"):
+        phase_rows = [row for row in timing_rows if row["phase"] == phase]
+        if not phase_rows:
+            continue
+        metrics = (
+            ("plan_ms", "plan_latency_ms"),
+            ("plan_to_submit_ms", "plan_to_submit_ms"),
+            ("start_to_wire_ms", "start_to_wire_ms"),
+            ("wire_to_local_fill_seen_ms", "wire_to_fill_callback_ms"),
+            ("wire_to_ack_ms", "wire_to_ack_ms"),
+        )
+        medians = {
+            label: median(
+                values
+            )
+            if (values := [row[field] for row in phase_rows if row[field] is not None])
+            else None
+            for label, field in metrics
+        }
+        print(f"execution_timing phase={phase} fills={len(phase_rows)} medians_ms={medians}")
     for target in SHADOW_TARGETS:
         print(
             f"shadow_price_ceiling target_bps={target} logged_blocks={result['shadow_attempts'][target]} "

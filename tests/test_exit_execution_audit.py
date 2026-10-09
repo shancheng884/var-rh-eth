@@ -138,3 +138,41 @@ def test_refresh_ceiling_is_price_only_and_keeps_runs_distinct(tmp_path) -> None
     assert result["shadow_attempts"][Decimal("3.5")] == 2
     assert result["shadow_lots"][Decimal("3.5")] == 2
     assert result["shadow_attempts"][Decimal("4.0")] == 0
+
+
+def test_execution_timing_audit_keeps_only_live_fills_and_classifies_phase(tmp_path) -> None:
+    path = tmp_path / "order_metrics.jsonl"
+    common = {
+        "event": "lighter_fill_timing",
+        "record_kind": "execution_lifecycle_timing",
+        "asset": "ETH",
+        "logged_at": "2026-10-05T00:00:00+00:00",
+        "auto_live_role": "paired_exit",
+        "lighter_reduce_only": True,
+        "live_submit_wire_timestamp_source": (
+            "local_websocket_send_completion_backprojected"
+        ),
+        "live_plan_latency_ms": "120",
+        "live_plan_ready_to_submit_start_ms": "8",
+        "live_submit_start_to_wire_sent_ms": "5",
+        "live_wire_sent_to_fill_ms": "312",
+        "live_wire_sent_to_submit_ack_ms": "10",
+    }
+    rows = [
+        {**common, "mode": "live", "trade_key": "live-1"},
+        {**common, "mode": "paper", "trade_key": "paper-1"},
+    ]
+    path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+
+    result = audit_files(
+        [path], since=datetime(2026, 10, 4, 16, tzinfo=timezone.utc), asset="ETH"
+    )
+
+    assert len(result["execution_timings"]) == 1
+    timing = result["execution_timings"][0]
+    assert timing["phase"] == "exit"
+    assert timing["wire_time_source"] == (
+        "local_websocket_send_completion_backprojected"
+    )
+    assert timing["plan_latency_ms"] == Decimal("120")
+    assert timing["wire_to_fill_callback_ms"] == Decimal("312")

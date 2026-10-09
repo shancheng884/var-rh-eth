@@ -635,6 +635,25 @@ def test_v4_live_funnel_reports_continuous_cycles_as_unlimited(capsys) -> None:
     assert "completed_cycles=27/unlimited" in capsys.readouterr().out
 
 
+def test_v4_live_funnel_shows_unknown_when_max_cycles_was_not_recorded(capsys) -> None:
+    rows = [
+        {
+            "run_id": "live-v4-legacy-cycle-limit",
+            "strategy_version": "basis-v4-live-v14",
+            "asset": "ETH",
+            "event": "live_inventory_strategy_snapshot",
+            "completed_cycles": 0,
+        }
+    ]
+
+    funnel = build_v4_live_funnel(rows)
+
+    assert funnel is not None
+    assert funnel["max_cycles"] is None
+    print_v4_live_funnel(rows)
+    assert "completed_cycles=0/unknown" in capsys.readouterr().out
+
+
 def test_v4_live_funnel_checkpoint_resolves_final_fill_wait_status() -> None:
     common = {
         "run_id": "live-v4-resolved-final-fill",

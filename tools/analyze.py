@@ -680,7 +680,7 @@ def build_v4_live_funnel(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
                 )
                 if value is not None
             ),
-            1,
+            None,
         ),
         "shadow_gradient_enabled": latest_strategy_snapshot.get(
             "shadow_gradient_enabled"
@@ -1060,8 +1060,13 @@ def print_v4_live_funnel(rows: list[dict[str, Any]]) -> None:
     if funnel is None:
         return
     print("== v4_live_funnel ==")
+    max_cycles = funnel["max_cycles"]
     max_cycles_text = (
-        "unlimited" if funnel["max_cycles"] == 0 else funnel["max_cycles"]
+        "unknown"
+        if max_cycles is None
+        else "unlimited"
+        if max_cycles == 0
+        else max_cycles
     )
     print(
         f"profile={funnel['profile']} samples={funnel['samples']} "

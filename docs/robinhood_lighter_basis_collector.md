@@ -1,15 +1,18 @@
-# Robinhood Chain Lighter basis sidecar
+# Lighter basis sidecar
 
-This sidecar measures executable ETH basis between Variational and the Lighter
-deployment on Robinhood Chain. It never submits trades or modifies inventory;
-validated baseline history can be consumed read-only by the V4 anchor:
+This read-only sidecar measures executable ETH basis between Variational and a
+Lighter deployment. The venue is inferred from the two REST endpoint hosts:
+Robinhood Chain is the default, and the mainnet endpoints are supported for a
+separate venue comparison. It never submits trades or modifies inventory.
+Robinhood baseline history can be consumed read-only by the V4 anchor:
 
 - It tails Variational quotes already written by the live V4 process under
   `log/basis_samples/ETH/`.
-- It also tails `log/order_metrics.jsonl` and takes a fresh Robinhood public
-  book snapshot at entry-candidate, entry-confirmed, exit-confirmed, and final
-  PnL events. Event rows use `sample_kind=trade_event`.
-- It connects only to the public Robinhood Lighter REST market-data API.
+- It also tails `log/order_metrics.jsonl` and takes a fresh public book snapshot
+  from the selected venue at entry-candidate, entry-confirmed, exit-confirmed,
+  and final PnL events. Event rows use `sample_kind=trade_event`.
+- It connects only to the public Lighter REST market-data API for the selected
+  venue.
 - It does not bind the Variational forwarder ports, request extra Variational
   quotes, import private keys, submit orders, or modify live inventory state.
 - It writes separate daily samples under
@@ -18,8 +21,10 @@ validated baseline history can be consumed read-only by the V4 anchor:
   health snapshot is `log/robinhood_basis_health.json`.
 
 The default executable depth ladder is USD 20, 40, and 60. Each sample records
-both trade directions, normalized Variational prices when present, source and
-book ages, nonce continuity, and depth prices.
+the resolved venue, both trade directions, normalized Variational prices when
+present, source and book ages, capture start/completion and book-receive
+timestamps, and depth prices. Mainnet rows are tagged `mainnet_lighter`; the
+live V4 anchor only loads rows tagged `robinhood_chain_lighter`.
 
 Trade-event snapshots preserve the source event, run, episode, lot, direction,
 and available Variational price/PnL fields. Cross-venue edge fields remain null
@@ -82,6 +87,35 @@ PY
 
 tail -n 30 log/robinhood_basis_collector.log
 ```
+
+## Mainnet comparison
+
+Run a second collector with mainnet endpoints and a separate output directory.
+Keep the Var source and order-event source pointed at the same live ETH files:
+
+```bash
+python tools/robinhood_basis_collector.py \
+  --asset ETH \
+  --source-root log/basis_samples \
+  --event-source-path log/order_metrics.jsonl \
+  --output-dir log/research_mainnet_shadow \
+  --rest-url https://mainnet.zklighter.elliot.ai/api/v1/orderBooks \
+  --order-book-orders-url https://mainnet.zklighter.elliot.ai/api/v1/orderBookOrders \
+  --max-source-age-seconds 1.5 \
+  --max-event-age-seconds 1.5
+```
+
+After deploying this collector revision, restart the sidecar so new rows carry
+the explicit venue label and capture-completion timestamp. Compare same-source,
+fresh samples with at most 0.5-second capture and book-receive skew using:
+
+```bash
+python tools/venue_comparison_audit.py --since-beijing YYYY-MM-DD
+```
+
+The audit compares executable book-depth edges at each shared notional. It does
+not predict fills or calculate realized PnL. Older rows without a capture
+timestamp or tagged `robinhood_chain_lighter` are excluded from mainnet pairs.
 
 Do not use these samples to enable Robinhood Lighter order submission. Collect
 at least seven days, preferably fourteen days spanning weekdays and weekends,
