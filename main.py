@@ -98,6 +98,9 @@ LIVE_INVENTORY_NEGATIVE_DIRECTION_MODE_CHOICES = (
     LIVE_INVENTORY_NEGATIVE_DIRECTION_MODE_PAUSE,
     LIVE_INVENTORY_NEGATIVE_DIRECTION_MODE_PENALIZE,
 )
+LIVE_INVENTORY_RH_MAINTENANCE_EXIT_SAMPLE_LOTS = frozenset(
+    str(lot_id) for lot_id in range(35, 43)
+)
 LIVE_INVENTORY_BASIS_V4_PROFILE_ETH_SHORT_20260724 = "eth_short_execution_calibrated_20260724_n10"
 LIVE_INVENTORY_BASIS_V4_PROFILE_CHOICES = (
     LIVE_INVENTORY_BASIS_V4_PROFILE_ETH_SHORT_20260724,
@@ -3524,6 +3527,8 @@ class VariationalToLighterRuntime:
                     direction = str(row.get("direction") or "")
                     if direction not in samples_by_direction:
                         continue
+                    if self.is_rh_maintenance_exit_sample(row):
+                        continue
                     if row.get("actual_pnl_status") != "lighter_final_fill_confirmed":
                         continue
                     estimated_bps = to_decimal(row.get("estimated_pnl_bps"))
@@ -3792,6 +3797,18 @@ class VariationalToLighterRuntime:
         lot.pop("v4_exit_confirmation_window", None)
         lot.pop("v4_exit_strong_stability_values", None)
 
+    @staticmethod
+    def is_rh_maintenance_exit_sample(row: dict[str, Any]) -> bool:
+        # Keep these fills in the ledger, but exclude the correlated outage exits from training.
+        return (
+            str(row.get("logged_at") or "").startswith(
+                ("2026-10-08T11:17:", "2026-10-08T11:18:")
+            )
+            and str(row.get("direction") or "") == DIRECTION_LONG_VAR_SHORT_LIGHTER
+            and str(row.get("lot_id"))
+            in LIVE_INVENTORY_RH_MAINTENANCE_EXIT_SAMPLE_LOTS
+        )
+
     def load_recent_live_inventory_actual_pnl_stats(self) -> None:
         orders_file = getattr(self, "orders_file", None)
         if orders_file is None or not orders_file.exists():
@@ -3818,6 +3835,8 @@ class VariationalToLighterRuntime:
                             quote_age_samples.append(quote_age)
                     if event != "live_inventory_actual_pnl":
                         continue
+                    if self.is_rh_maintenance_exit_sample(row):
+                        continue
                     direction = str(row.get("direction") or "")
                     pnl_bps = to_decimal(row.get("actual_pnl_bps"))
                     if direction in by_direction and pnl_bps is not None:
@@ -3838,22 +3857,6 @@ class VariationalToLighterRuntime:
         if not samples:
             return None
         return sum(samples) / Decimal(len(samples))
-
-    def live_inventory_direction_paused(self, direction: str) -> tuple[bool, dict[str, Any]]:
-        samples = list(getattr(self, "live_inventory_actual_pnl_bps_by_direction", {}).get(direction, []))
-        avg = sum(samples) / Decimal(len(samples)) if samples else None
-        context = {
-            "direction": direction,
-            "direction_sample_count": len(samples),
-            "direction_avg_actual_pnl_bps": decimal_to_str(avg),
-            "direction_min_samples": self.live_inventory_basis_direction_min_samples,
-            "direction_min_avg_pnl_bps": decimal_to_str(self.live_inventory_basis_direction_min_avg_pnl_bps),
-        }
-        if not self.live_inventory_basis_disable_negative_direction:
-            return False, context
-        if len(samples) < self.live_inventory_basis_direction_min_samples:
-            return False, context
-        return avg is not None and avg < self.live_inventory_basis_direction_min_avg_pnl_bps, context
 
     def live_inventory_direction_entry_threshold_bps(self, direction: str) -> Decimal:
         if direction == DIRECTION_LONG_VAR_SHORT_LIGHTER and self.live_inventory_basis_long_min_entry_edge_bps > 0:
@@ -3894,14 +3897,6 @@ class VariationalToLighterRuntime:
             direction
             for direction in allowed
             if thresholds.get(direction) is not None
-            and not (
-                getattr(
-                    self,
-                    "live_inventory_basis_disable_negative_direction",
-                    False,
-                )
-                and self.live_inventory_direction_paused(direction)[0]
-            )
         ]
         if not qualified:
             return self.live_inventory_basis_v4_entry_direction()
@@ -20251,22 +20246,6 @@ class VariationalToLighterRuntime:
                         continue
                 if v4_mode and direction != v4_entry_direction:
                     continue
-                if v4_mode and self.live_inventory_basis_v4_bidirectional:
-                    direction_paused, direction_context = (
-                        self.live_inventory_direction_paused(direction)
-                    )
-                    if direction_paused:
-                        self.live_inventory_basis_entry_confirm_counts[direction] = 0
-                        if index == 1 or index % 30 == 0:
-                            await self.append_live_inventory_log(
-                                "live_inventory_v4_entry_blocked",
-                                {
-                                    **state_payload,
-                                    "reason": "v4_direction_paused_negative_recent_pnl",
-                                    **direction_context,
-                                },
-                            )
-                        continue
                 is_negative_direction, negative_entry_penalty_bps, negative_abs_penalty_bps, negative_context = self.live_inventory_negative_direction_penalties(direction)
                 if (
                     not calibration_mode

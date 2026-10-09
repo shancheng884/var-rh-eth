@@ -350,7 +350,7 @@ def test_live_tool_v4_bidirectional_requires_continuous_real_gradient(
     assert args.live_inventory_max_cycles == 0
     assert args.live_inventory_max_lots == 0
     assert args.live_inventory_max_total_lots == 0
-    assert args.live_inventory_basis_disable_negative_direction is True
+    assert args.live_inventory_basis_disable_negative_direction is False
 
 
 def test_live_tool_close_open_position_uses_reconciled_one_shot_mode(

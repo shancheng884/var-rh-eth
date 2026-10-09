@@ -741,7 +741,6 @@ def build_main_command(
             command.append("--live-inventory-basis-v4-reverse-test")
         if v4_bidirectional:
             command.append("--live-inventory-basis-v4-bidirectional")
-            command.append("--live-inventory-basis-disable-negative-direction")
         if v4_continuous:
             command.append("--live-inventory-basis-v4-continuous")
     elif reversion_mode:

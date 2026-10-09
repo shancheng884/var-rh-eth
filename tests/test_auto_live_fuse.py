@@ -2791,6 +2791,16 @@ def test_v4_bidirectional_selects_best_flat_direction_and_locks_open_episode() -
         thresholds=thresholds,
     ) == "long_var_short_lighter"
 
+    runtime.live_inventory_basis_disable_negative_direction = True
+    runtime.live_inventory_actual_pnl_bps_by_direction = {
+        "long_var_short_lighter": deque([Decimal("-60")] * 8, maxlen=20),
+        "short_var_long_lighter": deque([Decimal("3")], maxlen=20),
+    }
+    assert runtime.live_inventory_basis_v4_select_entry_direction(
+        signal_edges=edges,
+        thresholds=thresholds,
+    ) == "long_var_short_lighter"
+
     runtime.live_inventory_open_lots = [
         {"direction": "short_var_long_lighter"}
     ]
@@ -2798,6 +2808,54 @@ def test_v4_bidirectional_selects_best_flat_direction_and_locks_open_episode() -
         signal_edges=edges,
         thresholds=thresholds,
     ) == "short_var_long_lighter"
+
+
+def test_rh_maintenance_exits_do_not_seed_strategy_samples(tmp_path) -> None:
+    runtime = VariationalToLighterRuntime.__new__(VariationalToLighterRuntime)
+    runtime.orders_file = Path(tmp_path) / "order_metrics.jsonl"
+    runtime.logger = logging.getLogger("test_rh_maintenance_samples")
+    runtime.live_inventory_actual_pnl_bps_by_direction = {
+        "long_var_short_lighter": deque(maxlen=20),
+        "short_var_long_lighter": deque(maxlen=20),
+    }
+    runtime.live_inventory_exit_fill_latency_ms_samples = deque(maxlen=20)
+    runtime.live_inventory_var_quote_age_seconds_samples = deque(maxlen=50)
+    runtime.live_inventory_exit_estimate_shortfall_bps_samples = deque(maxlen=20)
+    runtime.live_inventory_strong_single_shortfall_bps_samples = deque(maxlen=20)
+    runtime.live_inventory_exit_shortfall_bps_samples_by_direction = {
+        "long_var_short_lighter": deque(maxlen=20),
+        "short_var_long_lighter": deque(maxlen=20),
+    }
+    incident = {
+        "event": "live_inventory_actual_pnl",
+        "strategy_version": "basis-v4-live-v16-bidirectional",
+        "asset": "ETH",
+        "direction": "long_var_short_lighter",
+        "actual_pnl_status": "lighter_final_fill_confirmed",
+        "logged_at": "2026-10-08T11:17:58.877413+00:00",
+        "lot_id": 35,
+        "estimated_pnl_bps": "4",
+        "actual_pnl_bps": "-67.1654",
+        "exit_var_fill_to_lighter_fill_ms": "360",
+    }
+    ordinary = {
+        **incident,
+        "logged_at": "2026-10-09T11:17:58.877413+00:00",
+        "actual_pnl_bps": "-1",
+        "exit_var_fill_to_lighter_fill_ms": "320",
+    }
+    runtime.orders_file.write_text(
+        json.dumps(incident) + "\n" + json.dumps(ordinary) + "\n",
+        encoding="utf-8",
+    )
+
+    runtime.load_recent_live_inventory_actual_pnl_stats()
+    runtime.load_recent_live_inventory_exit_shortfall_bps()
+
+    assert list(runtime.live_inventory_actual_pnl_bps_by_direction["long_var_short_lighter"]) == [Decimal("-1")]
+    assert list(runtime.live_inventory_exit_shortfall_bps_samples_by_direction["long_var_short_lighter"]) == [Decimal("5")]
+    assert list(runtime.live_inventory_exit_fill_latency_ms_samples) == [Decimal("320")]
+    assert len(runtime.orders_file.read_text(encoding="utf-8").splitlines()) == 2
 
 
 def test_v4_bidirectional_uses_conservative_long_execution_reserves() -> None:
