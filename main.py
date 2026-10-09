@@ -15392,9 +15392,13 @@ class VariationalToLighterRuntime:
         reduce_only: bool = False,
         retry_price_boundary: Decimal | None = None,
         retry_index: int = 0,
+        prepared_plan: tuple[str, Decimal, int] | None = None,
+        prepared_best_bid_ask: tuple[Decimal, Decimal] | None = None,
+        limiter_acquired: bool = False,
     ) -> tuple[OrderLifecycle | None, dict[str, Any] | None]:
         limiter = self.live_inventory_order_limiter("lighter")
-        await limiter.acquire(urgent=reduce_only)
+        if not limiter_acquired:
+            await limiter.acquire(urgent=reduce_only)
         synthetic_key = f"auto:{asset}:{side.lower()}:{int(time.time() * 1000)}"
         record = OrderLifecycle(
             trade_key=synthetic_key,
@@ -15417,6 +15421,16 @@ class VariationalToLighterRuntime:
             lighter_reduce_only=reduce_only,
             lighter_exit_retry_price_boundary=retry_price_boundary,
             lighter_exit_retry_index=int(retry_index),
+            lighter_reference_bid=(
+                prepared_best_bid_ask[0]
+                if prepared_best_bid_ask is not None
+                else None
+            ),
+            lighter_reference_ask=(
+                prepared_best_bid_ask[1]
+                if prepared_best_bid_ask is not None
+                else None
+            ),
         )
         async with self._record_lock:
             self.set_record_stage(record, STAGE_RECORD_CREATED, clear_failure=True)
@@ -15424,7 +15438,10 @@ class VariationalToLighterRuntime:
             self.records[synthetic_key] = record
             self.record_order.append(synthetic_key)
         try:
-            await self.place_lighter_order(record)
+            if prepared_plan is None:
+                await self.place_lighter_order(record)
+            else:
+                await self.place_lighter_order(record, prepared_plan=prepared_plan)
         except Exception as exc:
             if self.live_inventory_rate_limit_error(exc):
                 await limiter.penalize(15.0)
@@ -15661,6 +15678,9 @@ class VariationalToLighterRuntime:
         var_amount: str,
         var_exit_price: Decimal,
         exit_lighter_depth: dict[str, Any] | None,
+        entry_var_price: Decimal,
+        entry_lighter_price: Decimal,
+        minimum_executable_pnl_bps: Decimal | None,
         reuse_quote_id: str | None = None,
     ) -> tuple[
         dict[str, Any] | None,
@@ -15674,6 +15694,7 @@ class VariationalToLighterRuntime:
     ]:
         pair_started_at = utc_now()
         pair_started_monotonic = time.monotonic()
+        lighter_side = "BUY" if exit_side.strip().upper() == "SELL" else "SELL"
         ledger_context = {
             "asset": asset,
             "lot_id": lot.get("lot_id"),
@@ -15682,12 +15703,172 @@ class VariationalToLighterRuntime:
             "direction": direction,
             "qty": decimal_to_str(qty),
             "var_side": exit_side,
-            "lighter_side": "BUY" if exit_side.strip().upper() == "SELL" else "SELL",
+            "lighter_side": lighter_side,
             "submit_mode": "concurrent",
             "reduce_only": True,
             "pair_submit_started_at": pair_started_at,
             "estimated_var_exit_price": decimal_to_str(var_exit_price),
             "exit_lighter_depth": exit_lighter_depth,
+        }
+
+        limiter = self.live_inventory_order_limiter("lighter")
+        preflight_reason: str | None = None
+        book: dict[str, Any] = {}
+        depth: dict[str, Any] = {}
+        executable_pnl_bps: Decimal | None = None
+        plan: tuple[str, Decimal, int] | None = None
+        recovery_guard = getattr(self, "live_inventory_lighter_recovery_guard", {})
+        recovery_state = (
+            str(recovery_guard.get("state") or "normal")
+            if isinstance(recovery_guard, dict)
+            else "normal"
+        )
+        try:
+            if Decimal(var_amount) != qty:
+                preflight_reason = "variational_exit_qty_rounding_mismatch"
+            elif not self.is_live_mode():
+                preflight_reason = "real_lighter_exit_requires_live_mode"
+            elif getattr(self, "live_inventory_dry_decisions", False):
+                preflight_reason = "live_inventory_dry_decisions_block_real_exit"
+            elif recovery_state in {"outage", "recovery"}:
+                preflight_reason = "lighter_market_recovery_confirmation_pending"
+                book = {"lighter_recovery_guard_state": recovery_state}
+            else:
+                await limiter.acquire(urgent=True)
+                book = await self.live_inventory_lighter_exit_snapshot(
+                    lighter_side=lighter_side,
+                    qty=qty,
+                )
+                book["lighter_recovery_guard_state"] = recovery_state
+            depth = book
+            if preflight_reason is None:
+                max_book_age = float(
+                    getattr(self, "live_inventory_max_lighter_book_age_seconds", 0.0)
+                )
+                book_age = depth.get("book_age_seconds")
+                if (
+                    not depth.get("book_depth_sufficient")
+                    or to_decimal(depth.get("estimated_fill_price")) is None
+                ):
+                    preflight_reason = "lighter_exit_depth_insufficient"
+                elif (
+                    book_age is None
+                    or book_age >= HEALTH_LIGHTER_BOOK_STALE_SECONDS
+                    or (max_book_age > 0 and book_age > max_book_age)
+                ):
+                    preflight_reason = "lighter_exit_book_stale"
+
+            executable_lighter_price = to_decimal(depth.get("estimated_fill_price"))
+            if preflight_reason is None and executable_lighter_price is not None:
+                _, _, executable_pnl = self.live_inventory_pair_pnl(
+                    direction=direction,
+                    qty=qty,
+                    entry_var_price=entry_var_price,
+                    entry_lighter_price=entry_lighter_price,
+                    exit_var_price=var_exit_price,
+                    exit_lighter_price=executable_lighter_price,
+                )
+                entry_notional = qty * entry_var_price
+                executable_pnl_bps = (
+                    executable_pnl / entry_notional * Decimal("10000")
+                    if entry_notional
+                    else None
+                )
+                if (
+                    minimum_executable_pnl_bps is not None
+                    and (
+                        executable_pnl_bps is None
+                        or executable_pnl_bps < minimum_executable_pnl_bps
+                    )
+                ):
+                    preflight_reason = "executable_exit_pnl_below_threshold"
+
+            preflight_key = (
+                f"preflight:{asset}:{lot.get('lot_id')}:{time.time_ns()}"
+            )
+            preflight_record = OrderLifecycle(
+                trade_key=preflight_key,
+                trade_id=preflight_key,
+                side=exit_side.lower(),
+                qty=qty,
+                asset=asset,
+                mode=self.mode,
+                last_variational_status="submitted",
+                var_fill_price=var_exit_price,
+                lighter_submit_transport=self.lighter_submit_transport,
+                lighter_order_mode=self.lighter_order_mode,
+                lighter_reduce_only=True,
+                auto_live_role="live_inventory_exit",
+                lighter_reference_bid=to_decimal(
+                    book.get("book_snapshot_best_bid")
+                ),
+                lighter_reference_ask=to_decimal(
+                    book.get("book_snapshot_best_ask")
+                ),
+            )
+            if preflight_reason is None:
+                plan = await self.build_hedge_plan(preflight_record)
+                if plan is None:
+                    preflight_reason = (
+                        preflight_record.failure_reason
+                        or "lighter_exit_order_plan_unavailable"
+                    )
+                else:
+                    planned_qty = Decimal(plan[2]) / self.base_amount_multiplier
+                    if planned_qty != qty:
+                        preflight_reason = "lighter_exit_qty_rounding_mismatch"
+        except Exception as exc:
+            preflight_reason = f"exit_preflight_error:{type(exc).__name__}:{exc}"
+            book = {"book_age_seconds": self._lighter_order_book_age_seconds()}
+            depth = book
+            executable_pnl_bps = None
+            plan = None
+
+        if preflight_reason is not None:
+            pair_context = {
+                **ledger_context,
+                "execution_stage": "preflight_rejected",
+                "preflight_rejected": True,
+                "preflight_reason": preflight_reason,
+                "preflight_book": book,
+                "lighter_recovery_guard_state": recovery_state,
+                "preflight_executable_pnl_bps": decimal_to_str(
+                    executable_pnl_bps
+                ),
+                "minimum_executable_pnl_bps": decimal_to_str(
+                    minimum_executable_pnl_bps
+                ),
+                "pair_submit_completed_at": utc_now(),
+                "pair_submit_elapsed_ms": elapsed_ms_str(pair_started_monotonic),
+            }
+            await self.append_live_inventory_log(
+                "live_inventory_execution_ledger", pair_context
+            )
+            return (
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                pair_context,
+            )
+
+        assert plan is not None
+        ledger_context["exit_lighter_depth"] = depth
+        ledger_context["preflight_executable_pnl_bps"] = decimal_to_str(
+            executable_pnl_bps
+        )
+        ledger_context["preflight_minimum_executable_pnl_bps"] = decimal_to_str(
+            minimum_executable_pnl_bps
+        )
+        ledger_context["lighter_prepared_order_plan"] = {
+            "side": plan[0],
+            "limit_price": decimal_to_str(plan[1]),
+            "base_amount": plan[2],
+            "book_update_at": book.get("book_update_at"),
+            "book_age_seconds": book.get("book_age_seconds"),
         }
         var_task = asyncio.create_task(
             self._timed_submit(
@@ -15712,6 +15893,12 @@ class VariationalToLighterRuntime:
                     cycle_id=int(lot.get("lot_id") or 0),
                     role="live_inventory_exit",
                     reduce_only=True,
+                    prepared_plan=plan,
+                    prepared_best_bid_ask=(
+                        to_decimal(book.get("book_snapshot_best_bid")),
+                        to_decimal(book.get("book_snapshot_best_ask")),
+                    ),
+                    limiter_acquired=True,
                 )
             )
         )
@@ -16232,6 +16419,80 @@ class VariationalToLighterRuntime:
     async def get_lighter_best_bid_ask(self) -> tuple[Decimal | None, Decimal | None]:
         async with self.lighter_order_book_lock:
             return self.lighter_best_bid, self.lighter_best_ask
+
+    async def live_inventory_lighter_exit_snapshot(
+        self, *, lighter_side: str, qty: Decimal
+    ) -> dict[str, Any]:
+        """Capture one RH book image for both exit valuation and IOC planning."""
+        async with self.lighter_order_book_lock:
+            bids = dict(self.lighter_order_book.get("bids", {}))
+            asks = dict(self.lighter_order_book.get("asks", {}))
+            update_at = self.last_lighter_order_book_update_at
+
+        age_seconds = self._age_seconds_from_iso(update_at)
+        best_bid = max(bids) if bids else None
+        best_ask = min(asks) if asks else None
+        normalized_side = lighter_side.strip().upper()
+        book_side = "asks" if normalized_side == "BUY" else "bids"
+        levels = asks if book_side == "asks" else bids
+        reference_price = best_ask if book_side == "asks" else best_bid
+        prices = sorted(levels) if book_side == "asks" else sorted(levels, reverse=True)
+        top_price = prices[0] if prices else None
+        top_size = levels.get(top_price) if top_price is not None else None
+        remaining = qty
+        filled_qty = Decimal("0")
+        notional = Decimal("0")
+        levels_used = 0
+        last_price: Decimal | None = None
+        if qty > 0:
+            for price in prices:
+                size = levels.get(price)
+                if size is None or size <= 0:
+                    continue
+                fill_qty = min(remaining, size)
+                filled_qty += fill_qty
+                notional += fill_qty * price
+                remaining -= fill_qty
+                levels_used += 1
+                last_price = price
+                if remaining <= 0:
+                    break
+
+        sufficient = qty > 0 and remaining <= 0 and notional > 0
+        estimated_fill = notional / qty if sufficient else None
+        slippage_bps: Decimal | None = None
+        if estimated_fill is not None and reference_price:
+            if normalized_side == "BUY":
+                slippage_bps = (estimated_fill - reference_price) / reference_price * Decimal("10000")
+            else:
+                slippage_bps = (reference_price - estimated_fill) / reference_price * Decimal("10000")
+            slippage_bps = max(Decimal("0"), slippage_bps)
+
+        return {
+            "lighter_side": normalized_side,
+            "requested_qty": decimal_to_str(qty),
+            "estimated_fill_price": decimal_to_str(estimated_fill),
+            "reference_price": decimal_to_str(reference_price),
+            "filled_qty": decimal_to_str(filled_qty),
+            "remaining_qty": decimal_to_str(remaining),
+            "filled_notional": decimal_to_str(notional),
+            "levels_used": levels_used,
+            "top_price": decimal_to_str(top_price),
+            "top_size": decimal_to_str(top_size),
+            "last_price": decimal_to_str(last_price),
+            "book_age_seconds": age_seconds,
+            "book_depth_sufficient": sufficient,
+            "slippage_bps": decimal_to_str(slippage_bps),
+            "book_update_at": update_at,
+            "best_bid": decimal_to_str(best_bid),
+            "best_ask": decimal_to_str(best_ask),
+            "book_snapshot_best_bid": decimal_to_str(
+                max(bids) if bids else None
+            ),
+            "book_snapshot_best_ask": decimal_to_str(
+                min(asks) if asks else None
+            ),
+        }
 
     def _lighter_order_book_age_seconds(self) -> float | None:
         return self._age_seconds_from_iso(self.last_lighter_order_book_update_at)
@@ -17342,7 +17603,12 @@ class VariationalToLighterRuntime:
                 payload = record.to_payload()
             await self.append_order_log("lighter_error", payload)
             return None
-        best_bid, best_ask = await self.get_lighter_best_bid_ask()
+        best_bid, best_ask = (
+            (record.lighter_reference_bid, record.lighter_reference_ask)
+            if record.lighter_reference_bid is not None
+            and record.lighter_reference_ask is not None
+            else await self.get_lighter_best_bid_ask()
+        )
         async with self._record_lock:
             record.lighter_reference_bid = best_bid
             record.lighter_reference_ask = best_ask
@@ -17604,7 +17870,12 @@ class VariationalToLighterRuntime:
             payload = record.to_payload()
         await self.append_order_log("lighter_dry_run_plan", payload)
 
-    async def place_lighter_order(self, record: OrderLifecycle) -> None:
+    async def place_lighter_order(
+        self,
+        record: OrderLifecycle,
+        *,
+        prepared_plan: tuple[str, Decimal, int] | None = None,
+    ) -> None:
         if not self.is_live_mode():
             async with self._record_lock:
                 record.hedge_error = f"Real Lighter hedge is only allowed in {MODE_LIVE} mode"
@@ -17636,7 +17907,11 @@ class VariationalToLighterRuntime:
             record.live_plan_started_at_iso = utc_now()
             record.live_plan_started_monotonic = time.monotonic()
 
-        plan = await self.build_hedge_plan(record)
+        plan = (
+            prepared_plan
+            if prepared_plan is not None
+            else await self.build_hedge_plan(record)
+        )
         if plan is None:
             return
 
@@ -24281,6 +24556,18 @@ class VariationalToLighterRuntime:
                     var_amount=var_amount,
                     var_exit_price=var_exit_price,
                     exit_lighter_depth=exit_lighter_depth,
+                    entry_var_price=entry_var_price,
+                    entry_lighter_price=entry_lighter_price,
+                    minimum_executable_pnl_bps=(
+                        effective_min_exit_pnl_bps
+                        if (
+                            should_exit
+                            and not should_stop
+                            and not should_timeout_exit
+                            and not should_account_risk_exit
+                        )
+                        else None
+                    ),
                     reuse_quote_id=exit_quote_id,
                 )
             else:
@@ -24302,6 +24589,39 @@ class VariationalToLighterRuntime:
                         context={"action": "exit", "lot_id": lot.get("lot_id"), "direction": direction, "qty": decimal_to_str(qty), "var_amount": var_amount},
                     )
                     return
+            if v4_mode and exit_pair_context.get("preflight_rejected"):
+                self.remove_pending_live_inventory_var_fill_match(
+                    asset=asset,
+                    lot_id=lot.get("lot_id"),
+                    role="live_inventory_exit",
+                )
+                self.live_inventory_basis_v4_reset_exit_confirmation(lot)
+                await self.persist_live_inventory_memory(
+                    reason="basis_exit_pair_preflight_rejected"
+                )
+                await self.append_live_inventory_log(
+                    "live_inventory_exit_blocked",
+                    {
+                        **state_payload,
+                        "lot_id": lot.get("lot_id"),
+                        "direction": direction,
+                        "reason": "basis_exit_pair_preflight_rejected",
+                        "preflight_reason": exit_pair_context.get(
+                            "preflight_reason"
+                        ),
+                        "preflight_book": exit_pair_context.get(
+                            "preflight_book"
+                        ),
+                        "preflight_executable_pnl_bps": exit_pair_context.get(
+                            "preflight_executable_pnl_bps"
+                        ),
+                        "minimum_executable_pnl_bps": exit_pair_context.get(
+                            "minimum_executable_pnl_bps"
+                        ),
+                        "action": "keep_position_open_and_recheck_on_next_fresh_book",
+                    },
+                )
+                return
             if var_exception is not None:
                 pending_exit_match.context = {
                     **(pending_exit_match.context or {}),
