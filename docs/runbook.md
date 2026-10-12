@@ -244,9 +244,11 @@ end. The legacy weekend flag is not needed in new commands.
 
 ## Log Maintenance
 
-`runtime.log` and `basis_collector.log` rotate automatically. Do not use a
-generic rotation command on `order_metrics.jsonl`: the strategy reads retained
-execution events from that file for calibration.
+`runtime.log`, `basis_collector.log`, and `robinhood_basis_collector.log` rotate
+automatically. `order_metrics.jsonl` is sealed at 512 MiB or at a UTC-day
+boundary. The strategy continues writing to a new active file; sealed segments
+are compressed and verified after 24 hours. Reports, calibration, and the RH
+collector read the active file and sealed segments in chronological order.
 
 Run the unified log maintenance preview regularly:
 
@@ -255,20 +257,21 @@ python tools/log_maintenance.py
 ```
 
 Execution requires all trading and collector writers to be stopped and the
-local live inventory state to be flat with no pending actions. It compresses
-`order_metrics.jsonl` once it reaches 512 MiB, archives oversized raw capture
+local live inventory state to be flat with no pending actions. It archives a
+legacy oversized active `order_metrics.jsonl`, archives oversized raw capture
 logs, compresses closed mainnet/RH basis days, and removes sample days older
 than 45 days. Raw capture archives expire after 14 days; market and paper log
-archives expire after 45 days. The exact full order-metrics archives remain
-protected. Use:
+archives expire after 45 days. Full order-metrics segments remain protected.
+Use:
 
 ```bash
 python tools/log_maintenance.py --execute
 ```
 
-The live strategy also records repeated basis-state snapshots less often and
-blocks new entries/add-ons below 3 GiB free disk while continuing to manage
-existing positions. Closed-day sample retention preserves at least 30 days.
+The live strategy also records repeated basis-state snapshots less often,
+compresses closed UTC days from its primary basis sample store, and blocks new
+entries/add-ons below 3 GiB free disk while continuing to manage existing
+positions. Closed-day sample retention preserves 45 days.
 The 4 GiB log-directory budget is a monitoring target; if protected full order
 archives push usage over it, keep them and add disk or move verified archives
 off-host rather than deleting execution history.

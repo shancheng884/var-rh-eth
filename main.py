@@ -43,7 +43,7 @@ from tools.lib.pnl_baseline import (
     set_pnl_latest_account_snapshot,
 )
 from tools.lib.rolling_rate_limiter import RollingWindowRateLimiter
-from tools.lib.runtime_files import read_json, write_json_atomic
+from tools.lib.runtime_files import iter_jsonl_lines, read_json, write_json_atomic
 from tools.lib.telegram_notifier import TelegramNotifier
 from variational.listener import (
     CommandBroker,
@@ -68,6 +68,10 @@ from paper_engine import (
 )
 from inventory_engine import DIRECTION_LONG_VAR_SHORT_LIGHTER, DIRECTION_SHORT_VAR_LONG_LIGHTER, PaperInventoryEngine
 from tools.lib.basis_store import BasisSampleStore, read_basis_samples
+from tools.lib.order_metrics_store import (
+    append_order_metrics_line,
+    compress_closed_order_metrics,
+)
 
 MODE_OBSERVE = "observe"
 MODE_DRY_RUN = "dry-run"
@@ -3000,32 +3004,31 @@ class VariationalToLighterRuntime:
             DIRECTION_SHORT_VAR_LONG_LIGHTER: deque(maxlen=20),
         }
         try:
-            with orders_file.open("r", encoding="utf-8") as handle:
-                for line in handle:
-                    if '"event": "live_inventory_final_pnl"' not in line:
-                        continue
-                    try:
-                        row = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if not str(row.get("strategy_version") or "").startswith(
-                        "basis-v4-live"
-                    ):
-                        continue
-                    if str(row.get("asset") or "").upper() != "ETH":
-                        continue
-                    direction = str(row.get("direction") or "")
-                    if direction not in samples_by_direction:
-                        continue
-                    if row.get("final_pnl_status") != "var_and_lighter_final_fills_confirmed":
-                        continue
-                    loss_bps = to_decimal(row.get("entry_edge_capture_loss_bps"))
-                    if loss_bps is not None:
-                        # Zero-loss fills are observations and must contribute to
-                        # calibration maturity instead of biasing P80 upward.
-                        samples_by_direction[direction].append(
-                            max(loss_bps, Decimal("0"))
-                        )
+            for line in iter_jsonl_lines(orders_file):
+                if '"event": "live_inventory_final_pnl"' not in line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not str(row.get("strategy_version") or "").startswith(
+                    "basis-v4-live"
+                ):
+                    continue
+                if str(row.get("asset") or "").upper() != "ETH":
+                    continue
+                direction = str(row.get("direction") or "")
+                if direction not in samples_by_direction:
+                    continue
+                if row.get("final_pnl_status") != "var_and_lighter_final_fills_confirmed":
+                    continue
+                loss_bps = to_decimal(row.get("entry_edge_capture_loss_bps"))
+                if loss_bps is not None:
+                    # Zero-loss fills are observations and must contribute to
+                    # calibration maturity instead of biasing P80 upward.
+                    samples_by_direction[direction].append(
+                        max(loss_bps, Decimal("0"))
+                    )
         except OSError as exc:
             self.logger.warning("Could not load recent live inventory execution loss samples: %s", exc)
             return
@@ -3110,37 +3113,36 @@ class VariationalToLighterRuntime:
         if orders_file is None or not orders_file.exists():
             return
         try:
-            with orders_file.open("r", encoding="utf-8") as handle:
-                for line in handle:
-                    if '"event": "live_inventory_entry_rfq_calibration"' not in line:
-                        continue
-                    try:
-                        row = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    # Earlier calibration rows compared an exact Lighter depth
-                    # quote with a passive quote from a different market moment.
-                    # They are not safe inputs for the predictor.
-                    if row.get(
-                        "calibration_basis"
-                    ) != "same_lighter_reference_var_price_delta_v1":
-                        continue
-                    if str(row.get("asset") or "").upper() != "ETH":
-                        continue
-                    direction = str(row.get("direction") or "")
-                    if direction not in targets:
-                        continue
-                    passive_edge_bps = to_decimal(row.get("passive_edge_bps"))
-                    exact_edge_bps = to_decimal(row.get("exact_edge_bps"))
-                    logged_at = parse_utc_iso(row.get("logged_at"))
-                    if (
-                        passive_edge_bps is None
-                        or exact_edge_bps is None
-                        or logged_at is None
-                    ):
-                        continue
-                    targets[direction].append(exact_edge_bps - passive_edge_bps)
-                    timestamp_targets[direction].append(logged_at.timestamp())
+            for line in iter_jsonl_lines(orders_file):
+                if '"event": "live_inventory_entry_rfq_calibration"' not in line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                # Earlier calibration rows compared an exact Lighter depth
+                # quote with a passive quote from a different market moment.
+                # They are not safe inputs for the predictor.
+                if row.get(
+                    "calibration_basis"
+                ) != "same_lighter_reference_var_price_delta_v1":
+                    continue
+                if str(row.get("asset") or "").upper() != "ETH":
+                    continue
+                direction = str(row.get("direction") or "")
+                if direction not in targets:
+                    continue
+                passive_edge_bps = to_decimal(row.get("passive_edge_bps"))
+                exact_edge_bps = to_decimal(row.get("exact_edge_bps"))
+                logged_at = parse_utc_iso(row.get("logged_at"))
+                if (
+                    passive_edge_bps is None
+                    or exact_edge_bps is None
+                    or logged_at is None
+                ):
+                    continue
+                targets[direction].append(exact_edge_bps - passive_edge_bps)
+                timestamp_targets[direction].append(logged_at.timestamp())
         except OSError as exc:
             logger = getattr(self, "logger", None)
             if logger is not None:
@@ -3515,43 +3517,42 @@ class VariationalToLighterRuntime:
             maxlen=strong_single_target.maxlen
         )
         try:
-            with orders_file.open("r", encoding="utf-8") as handle:
-                for line in handle:
-                    if '"event": "live_inventory_actual_pnl"' not in line:
-                        continue
-                    try:
-                        row = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if str(row.get("strategy_version") or "") not in (
-                        LIVE_INVENTORY_BASIS_V4_EXIT_CALIBRATION_STRATEGY_VERSIONS
-                    ):
-                        continue
-                    if str(row.get("asset") or "").upper() != "ETH":
-                        continue
-                    direction = str(row.get("direction") or "")
-                    if direction not in samples_by_direction:
-                        continue
-                    if self.is_rh_maintenance_exit_sample(row):
-                        continue
-                    if row.get("actual_pnl_status") != "lighter_final_fill_confirmed":
-                        continue
-                    estimated_bps = to_decimal(row.get("estimated_pnl_bps"))
-                    actual_bps = to_decimal(row.get("actual_pnl_bps"))
-                    if estimated_bps is None or actual_bps is None:
-                        continue
-                    # Zero-shortfall fills are real observations and must count
-                    # toward calibration maturity instead of biasing the sample.
-                    shortfall_bps = max(
-                        estimated_bps - actual_bps,
-                        Decimal("0"),
-                    )
-                    samples_by_direction[direction].append(shortfall_bps)
-                    if (
-                        direction == DIRECTION_SHORT_VAR_LONG_LIGHTER
-                        and row.get("exit_confirmation_mode") == "strong_single"
-                    ):
-                        strong_single_samples.append(shortfall_bps)
+            for line in iter_jsonl_lines(orders_file):
+                if '"event": "live_inventory_actual_pnl"' not in line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if str(row.get("strategy_version") or "") not in (
+                    LIVE_INVENTORY_BASIS_V4_EXIT_CALIBRATION_STRATEGY_VERSIONS
+                ):
+                    continue
+                if str(row.get("asset") or "").upper() != "ETH":
+                    continue
+                direction = str(row.get("direction") or "")
+                if direction not in samples_by_direction:
+                    continue
+                if self.is_rh_maintenance_exit_sample(row):
+                    continue
+                if row.get("actual_pnl_status") != "lighter_final_fill_confirmed":
+                    continue
+                estimated_bps = to_decimal(row.get("estimated_pnl_bps"))
+                actual_bps = to_decimal(row.get("actual_pnl_bps"))
+                if estimated_bps is None or actual_bps is None:
+                    continue
+                # Zero-shortfall fills are real observations and must count
+                # toward calibration maturity instead of biasing the sample.
+                shortfall_bps = max(
+                    estimated_bps - actual_bps,
+                    Decimal("0"),
+                )
+                samples_by_direction[direction].append(shortfall_bps)
+                if (
+                    direction == DIRECTION_SHORT_VAR_LONG_LIGHTER
+                    and row.get("exit_confirmation_mode") == "strong_single"
+                ):
+                    strong_single_samples.append(shortfall_bps)
         except OSError as exc:
             self.logger.warning("Could not load recent live inventory exit shortfall samples: %s", exc)
             return
@@ -3825,30 +3826,29 @@ class VariationalToLighterRuntime:
         latency_samples: deque[Decimal] = deque(maxlen=20)
         quote_age_samples: deque[Decimal] = deque(maxlen=50)
         try:
-            with orders_file.open("r", encoding="utf-8") as handle:
-                for line in handle:
-                    if '"event": "live_inventory_' not in line:
-                        continue
-                    try:
-                        row = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    event = str(row.get("event") or "")
-                    if event in {"live_inventory_basis_state", "live_inventory_entry_blocked", "live_inventory_entered", "live_inventory_exited"}:
-                        quote_age = to_decimal(row.get("var_quote_age_seconds"))
-                        if quote_age is not None and quote_age >= 0:
-                            quote_age_samples.append(quote_age)
-                    if event != "live_inventory_actual_pnl":
-                        continue
-                    if self.is_rh_maintenance_exit_sample(row):
-                        continue
-                    direction = str(row.get("direction") or "")
-                    pnl_bps = to_decimal(row.get("actual_pnl_bps"))
-                    if direction in by_direction and pnl_bps is not None:
-                        by_direction[direction].append(pnl_bps)
-                    latency_ms = to_decimal(row.get("exit_var_fill_to_lighter_fill_ms"))
-                    if latency_ms is not None and latency_ms >= 0:
-                        latency_samples.append(latency_ms)
+            for line in iter_jsonl_lines(orders_file):
+                if '"event": "live_inventory_' not in line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                event = str(row.get("event") or "")
+                if event in {"live_inventory_basis_state", "live_inventory_entry_blocked", "live_inventory_entered", "live_inventory_exited"}:
+                    quote_age = to_decimal(row.get("var_quote_age_seconds"))
+                    if quote_age is not None and quote_age >= 0:
+                        quote_age_samples.append(quote_age)
+                if event != "live_inventory_actual_pnl":
+                    continue
+                if self.is_rh_maintenance_exit_sample(row):
+                    continue
+                direction = str(row.get("direction") or "")
+                pnl_bps = to_decimal(row.get("actual_pnl_bps"))
+                if direction in by_direction and pnl_bps is not None:
+                    by_direction[direction].append(pnl_bps)
+                latency_ms = to_decimal(row.get("exit_var_fill_to_lighter_fill_ms"))
+                if latency_ms is not None and latency_ms >= 0:
+                    latency_samples.append(latency_ms)
         except OSError as exc:
             self.logger.warning("Could not load recent live inventory actual PnL stats: %s", exc)
             return
@@ -16900,7 +16900,32 @@ class VariationalToLighterRuntime:
         ) + "\n"
         async with self._order_write_lock:
             await asyncio.to_thread(self.orders_file.parent.mkdir, parents=True, exist_ok=True)
-            await asyncio.to_thread(self._append_line, self.orders_file, line)
+            rotated = await asyncio.to_thread(
+                append_order_metrics_line, self.orders_file, line
+            )
+            if rotated is not None:
+                self.logger.warning(
+                    "order_metrics_segment_rotated path=%s bytes=%s",
+                    rotated.name,
+                    rotated.stat().st_size,
+                )
+
+    async def maintain_order_metrics_archives(self) -> None:
+        while not self.stop_flag:
+            if self.orders_file is not None:
+                try:
+                    archives = await asyncio.to_thread(
+                        compress_closed_order_metrics, self.orders_file
+                    )
+                    for archive in archives:
+                        self.logger.info(
+                            "order_metrics_segment_compressed path=%s bytes=%s",
+                            archive.name,
+                            archive.stat().st_size,
+                        )
+                except Exception:
+                    self.logger.exception("order_metrics_archive_maintenance_failed")
+            await asyncio.sleep(60)
 
     async def append_opportunity_log(self, event_type: str, payload: dict[str, Any]) -> None:
         if self.opportunities_file is None:
@@ -20358,6 +20383,12 @@ class VariationalToLighterRuntime:
                     "strategy_variant": self.live_inventory_strategy_variant,
                     "asset": asset,
                 },
+            )
+            await asyncio.to_thread(
+                self.live_inventory_basis_v4_store.rotate_closed_days,
+                current_day=datetime.fromtimestamp(
+                    v4_now, tz=timezone.utc
+                ).date().isoformat(),
             )
         if v4_mode and not duplicate_passive_reference:
             await self.maybe_update_live_inventory_basis_v4_shadow_gradient(
@@ -27368,6 +27399,10 @@ class VariationalToLighterRuntime:
         self.trade_event_min_timestamp = datetime.now(timezone.utc)
         self.logger.info("Tracking new Variational trade events from seq>%s", self.trade_event_cursor)
 
+        self.track_background_task(
+            asyncio.create_task(self.maintain_order_metrics_archives()),
+            "order_metrics_archive_maintenance",
+        )
         self.trade_task = self.track_background_task(asyncio.create_task(self.trade_loop()), "trade_loop")
         if self.requires_lighter_market_data():
             self.spread_task = self.track_background_task(asyncio.create_task(self.spread_loop()), "spread_loop")

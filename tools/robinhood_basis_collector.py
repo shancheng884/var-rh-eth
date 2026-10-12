@@ -33,6 +33,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from tools.lib.basis_store import BasisSampleStore  # noqa: E402
+from tools.lib.jsonl_follower import FixedJsonlFollower  # noqa: E402
 
 
 ROBINHOOD_LIGHTER_REST_URL = "https://api.rh.lighter.xyz/api/v1/orderBooks"
@@ -115,45 +116,6 @@ def infer_venue(rest_url: str, orders_url: str) -> str:
         if rest_host == host:
             return venue
     raise ValueError(f"unsupported Lighter market-data host: {rest_host or '-'}")
-
-
-class FixedJsonlFollower:
-    """Follow appended complete JSON lines from one file."""
-
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self.position = 0
-        self.buffer = b""
-
-    def read_new(self) -> list[dict[str, Any]]:
-        if not self.path.exists():
-            return []
-        size = self.path.stat().st_size
-        if size < self.position:
-            self.position = 0
-            self.buffer = b""
-        with self.path.open("rb") as handle:
-            handle.seek(self.position)
-            chunk = handle.read()
-            self.position = handle.tell()
-        if not chunk:
-            return []
-        payload = self.buffer + chunk
-        lines = payload.split(b"\n")
-        self.buffer = lines.pop()
-        rows: list[dict[str, Any]] = []
-        for line in lines:
-            try:
-                row = json.loads(line)
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                continue
-            if isinstance(row, dict):
-                rows.append(row)
-        return rows
-
-    def seek_to_end(self) -> None:
-        self.position = self.path.stat().st_size if self.path.exists() else 0
-        self.buffer = b""
 
 
 class CurrentDayJsonlFollower:

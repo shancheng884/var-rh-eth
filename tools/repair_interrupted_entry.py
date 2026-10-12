@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import argparse
 import copy
+import gzip
 import json
 import os
 import subprocess
 import sys
+from collections import deque
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -19,6 +21,7 @@ from tools.lib.runtime_files import (  # noqa: E402
     LIVE_STATE,
     ORDER_METRICS,
     read_json,
+    rotated_jsonl_paths,
     to_decimal,
     write_json_atomic,
 )
@@ -27,7 +30,16 @@ DIRECTION_LONG = "long_var_short_lighter"
 DIRECTION_SHORT = "short_var_long_lighter"
 
 
-def _reverse_lines(path: Path, *, block_size: int = 1024 * 1024):
+def _reverse_lines(
+    path: Path, *, block_size: int = 1024 * 1024, limit: int = 5000
+):
+    if path.suffix == ".gz":
+        tail: deque[bytes] = deque(maxlen=max(1, limit))
+        with gzip.open(path, "rb") as handle:
+            for line in handle:
+                tail.append(line.rstrip(b"\n"))
+        yield from reversed(tail)
+        return
     with path.open("rb") as handle:
         handle.seek(0, os.SEEK_END)
         position = handle.tell()
@@ -57,31 +69,35 @@ def _recovery_rows_from_end(
     submit_found = False
     lighter_found = False
     try:
-        lines = _reverse_lines(path)
-        for index, raw in enumerate(lines, 1):
-            if index > max(1, limit):
+        scanned = 0
+        for source in reversed(rotated_jsonl_paths(path)):
+            for raw in _reverse_lines(source, limit=max(1, limit - scanned)):
+                scanned += 1
+                try:
+                    row = json.loads(raw)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                is_submit = (
+                    row.get("event") == "live_inventory_var_entry_submitted"
+                    and str(row.get("lot_id")) == str(lot_id)
+                    and str(row.get("run_id") or "") == run_id
+                )
+                is_lighter = (
+                    row.get("event") == "lighter_fill"
+                    and str(row.get("trade_key") or "") == lighter_record_key
+                )
+                if is_submit and not submit_found:
+                    rows.append(row)
+                    submit_found = True
+                elif is_lighter and not lighter_found:
+                    rows.append(row)
+                    lighter_found = True
+                if submit_found and lighter_found:
+                    return rows
+                if scanned >= max(1, limit):
+                    break
+            if scanned >= max(1, limit):
                 break
-            try:
-                row = json.loads(raw)
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                continue
-            is_submit = (
-                row.get("event") == "live_inventory_var_entry_submitted"
-                and str(row.get("lot_id")) == str(lot_id)
-                and str(row.get("run_id") or "") == run_id
-            )
-            is_lighter = (
-                row.get("event") == "lighter_fill"
-                and str(row.get("trade_key") or "") == lighter_record_key
-            )
-            if is_submit and not submit_found:
-                rows.append(row)
-                submit_found = True
-            elif is_lighter and not lighter_found:
-                rows.append(row)
-                lighter_found = True
-            if submit_found and lighter_found:
-                return rows
     except FileNotFoundError:
         pass
     missing = []

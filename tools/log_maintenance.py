@@ -160,8 +160,11 @@ def main() -> int:
         and (LOG_DIR / name).stat().st_size >= ROTATE_THRESHOLD
     ]
     metrics_size = ORDER_METRICS.stat().st_size if ORDER_METRICS.exists() else 0
-    full_archives = list(LOG_DIR.glob("order_metrics.jsonl.full-*.gz"))
-    protected_archive_bytes = sum(path.stat().st_size for path in full_archives)
+    protected_archives = [
+        *LOG_DIR.glob("order_metrics.jsonl.full-*.gz"),
+        *LOG_DIR.glob("order_metrics.jsonl.segment-*.jsonl.gz"),
+    ]
+    protected_archive_bytes = sum(path.stat().st_size for path in protected_archives)
     current_log_bytes = log_size(LOG_DIR)
     free_bytes = shutil.disk_usage(LOG_DIR if LOG_DIR.exists() else ROOT).free
     processes = active_writers()
@@ -194,10 +197,11 @@ def main() -> int:
                 f"required_gb={required_free / 1024**3:.2f}"
             )
             return 2
-        archive, _, retained = compact(ORDER_METRICS)
+        archive, source_lines, _ = compact(ORDER_METRICS)
         print(
-            f"order_metrics_compacted=YES retained_bytes={retained} "
-            f"archive={archive.name}"
+            f"order_metrics_archived=YES source_lines={source_lines} "
+            f"archive={archive.name} archive_bytes={archive.stat().st_size} "
+            f"active_bytes={ORDER_METRICS.stat().st_size}"
         )
     else:
         print("order_metrics_compacted=NO reason=below_512_mb")
@@ -218,7 +222,7 @@ def main() -> int:
         path.unlink()
     print(f"expired_raw_archives_removed={len(old_raw_archives)}")
     print(f"log_dir_after_gb={log_size(LOG_DIR) / 1024**3:.2f}")
-    print("order_metrics_full_archives=preserved")
+    print("order_metrics_archives=preserved")
     return 0
 
 

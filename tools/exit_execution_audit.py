@@ -229,7 +229,8 @@ def main() -> int:
     window = parser.add_mutually_exclusive_group()
     window.add_argument("--since-beijing", help="Beijing calendar date YYYY-MM-DD")
     window.add_argument("--hours", type=float, default=24)
-    parser.add_argument("--include-rotated", action="store_true")
+    parser.add_argument("--include-rotated", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--current-only", action="store_true")
     args = parser.parse_args()
     if args.since_beijing:
         try:
@@ -241,7 +242,7 @@ def main() -> int:
         if args.hours <= 0:
             parser.error("--hours must be positive")
         since = datetime.now(timezone.utc) - timedelta(hours=args.hours)
-    paths = rotated_jsonl_paths(ORDER_METRICS) if args.include_rotated else [ORDER_METRICS]
+    paths = [ORDER_METRICS] if args.current_only else rotated_jsonl_paths(ORDER_METRICS)
     paths = [path for path in paths if path.exists()]
     if not paths:
         parser.error(f"order metrics file not found: {ORDER_METRICS}")

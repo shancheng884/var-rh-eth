@@ -14,7 +14,13 @@ from typing import Any, Iterable
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from tools.lib.runtime_files import ORDER_METRICS, fmt_decimal, parse_time, to_decimal
+from tools.lib.runtime_files import (
+    ORDER_METRICS,
+    fmt_decimal,
+    parse_time,
+    rotated_jsonl_paths,
+    to_decimal,
+)
 
 
 DIRECTION_LONG = "long_var_short_lighter"
@@ -43,15 +49,16 @@ COMPACT_FIELDS = {
 
 
 def _iter_jsonl(path: Path) -> Iterable[dict[str, Any]]:
-    opener = gzip.open if path.suffix == ".gz" else open
-    with opener(path, "rt", encoding="utf-8", errors="replace") as handle:
-        for line in handle:
-            try:
-                value = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(value, dict):
-                yield value
+    for source_path in rotated_jsonl_paths(path):
+        opener = gzip.open if source_path.suffix == ".gz" else open
+        with opener(source_path, "rt", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                try:
+                    value = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(value, dict):
+                    yield value
 
 
 def load_recent_basis_states(

@@ -22,6 +22,10 @@ from tools.lib.telegram_notifier import (  # noqa: E402
     TelegramNotifier,
     format_telegram_trade_message,
 )
+from tools.lib.runtime_files import (  # noqa: E402
+    iter_jsonl_lines,
+    rotated_jsonl_paths,
+)
 from tools.lib.pnl_baseline import (  # noqa: E402
     BEIJING_TIMEZONE,
     PNL_BASELINE_FILE_NAME,
@@ -111,24 +115,23 @@ def load_rows(
     include_events: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    if not path.exists():
+    if not rotated_jsonl_paths(path):
         return rows
     relevant_events = RELEVANT_EVENTS | set(include_events or ())
     needles = tuple(f'"event": "{event}"' for event in relevant_events)
-    with path.open("r", encoding="utf-8", errors="ignore") as handle:
-        for line in handle:
-            if not any(needle in line for needle in needles):
-                continue
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if str(row.get("event") or "") not in relevant_events:
-                continue
-            row_asset = str(row.get("asset") or "").upper()
-            if row_asset and row_asset != asset:
-                continue
-            rows.append(row)
+    for line in iter_jsonl_lines(path):
+        if not any(needle in line for needle in needles):
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if str(row.get("event") or "") not in relevant_events:
+            continue
+        row_asset = str(row.get("asset") or "").upper()
+        if row_asset and row_asset != asset:
+            continue
+        rows.append(row)
     return rows
 
 

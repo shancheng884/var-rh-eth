@@ -35,12 +35,28 @@ def compress_jsonl(path: Path) -> Path:
     """Compress a closed JSONL file atomically, preserving the source on failure."""
     target = Path(str(path) + ".gz")
     temporary = Path(str(target) + ".tmp")
-    with path.open("rb") as source, gzip.open(temporary, "wb", compresslevel=6) as destination:
-        while chunk := source.read(1024 * 1024):
-            destination.write(chunk)
-    os.replace(temporary, target)
-    path.unlink()
-    return target
+    if target.exists() or temporary.exists():
+        raise FileExistsError(f"basis archive already exists: {target.name}")
+    source_digest = hashlib.sha256()
+    try:
+        with path.open("rb") as source, gzip.open(
+            temporary, "wb", compresslevel=6
+        ) as destination:
+            while chunk := source.read(1024 * 1024):
+                source_digest.update(chunk)
+                destination.write(chunk)
+        archive_digest = hashlib.sha256()
+        with gzip.open(temporary, "rb") as archived:
+            while chunk := archived.read(1024 * 1024):
+                archive_digest.update(chunk)
+        if archive_digest.digest() != source_digest.digest():
+            raise OSError("basis sample archive verification failed")
+        os.replace(temporary, target)
+        path.unlink()
+        return target
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
 
 
 @dataclass
@@ -76,6 +92,7 @@ class BasisSampleStore:
         self.retention_days = retention_days
         self.stats: dict[tuple[str, str], DayStats] = {}
         self._last_prune_day: str | None = None
+        self._last_rotation_day: str | None = None
         self.root.mkdir(parents=True, exist_ok=True)
 
     def append(self, row: dict[str, Any]) -> Path:
@@ -128,14 +145,20 @@ class BasisSampleStore:
 
     def rotate_closed_days(self, *, current_day: str | None = None) -> list[Path]:
         today = current_day or _utc_day()
+        if self._last_rotation_day == today:
+            return []
         compressed: list[Path] = []
         for path in sorted(self.root.glob("*/*.jsonl")):
             if path.stem >= today:
                 continue
+            if Path(str(path) + ".gz").exists():
+                # Late rows can recreate a raw file after that UTC day was
+                # archived. Keep the new rows intact rather than overwrite data.
+                continue
             compressed.append(compress_jsonl(path))
-        if self._last_prune_day != today:
-            self.prune_expired_days(current_day=today)
-            self._last_prune_day = today
+        self.prune_expired_days(current_day=today)
+        self._last_prune_day = today
+        self._last_rotation_day = today
         return compressed
 
     def prune_expired_days(self, *, current_day: str | None = None) -> list[Path]:
@@ -173,7 +196,14 @@ def basis_sample_paths(root: Path, asset_filter: str | None = None) -> list[Path
             continue
         paths.extend(asset_dir.glob("*.jsonl"))
         paths.extend(asset_dir.glob("*.jsonl.gz"))
-    return sorted(paths, key=lambda path: (path.parent.name, path.name))
+    return sorted(
+        paths,
+        key=lambda path: (
+            path.parent.name,
+            path.name[:10],
+            0 if path.name.endswith(".jsonl.gz") else 1,
+        ),
+    )
 
 
 def read_basis_samples(

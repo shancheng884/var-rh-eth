@@ -29,6 +29,7 @@ if str(ROOT) not in sys.path:
 
 from tools.lib.runtime_files import read_json, write_json_atomic
 from tools.lib.alert_localization import action_cn, incident_key_cn, reason_cn
+from tools.lib.jsonl_follower import FixedJsonlFollower
 from tools.lib.risk_alert_control import (
     notifications_allowed,
     read_alert_control,
@@ -305,35 +306,27 @@ class JsonlFollower:
     def __init__(self, path: Path, *, initial_bytes: int = 2_000_000) -> None:
         self.path = path
         self.initial_bytes = max(4096, initial_bytes)
-        self.offset: int | None = None
         self.rows: deque[dict[str, Any]] = deque(maxlen=500)
+        self._follower = FixedJsonlFollower(path)
+        self._initialized = False
+        self._initial_signatures: set[str] = set()
 
     def read(self) -> list[dict[str, Any]]:
-        try:
-            size = self.path.stat().st_size
-        except OSError:
-            return list(self.rows)
-        if self.offset is None or size < self.offset:
-            start = max(0, size - self.initial_bytes)
-        else:
-            start = self.offset
-        try:
-            with self.path.open("rb") as handle:
-                handle.seek(start)
-                data = handle.read()
-        except OSError:
-            return list(self.rows)
-        self.offset = start + len(data)
-        lines = data.splitlines()
-        if start > 0 and lines:
-            lines = lines[1:]
-        for line in lines:
-            try:
-                value = json.loads(line.decode("utf-8", errors="replace"))
-            except (UnicodeDecodeError, json.JSONDecodeError):
+        if not self._initialized:
+            self._follower.seek_to_end()
+            initial_rows = self._follower.read_recent_rows(self.initial_bytes)[-500:]
+            self.rows.extend(initial_rows)
+            self._initial_signatures = {
+                json.dumps(row, ensure_ascii=True, sort_keys=True)
+                for row in initial_rows
+            }
+            self._initialized = True
+        for value in self._follower.read_new():
+            signature = json.dumps(value, ensure_ascii=True, sort_keys=True)
+            if signature in self._initial_signatures:
+                self._initial_signatures.discard(signature)
                 continue
-            if isinstance(value, dict):
-                self.rows.append(value)
+            self.rows.append(value)
         return list(self.rows)
 
 

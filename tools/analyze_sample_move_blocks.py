@@ -397,7 +397,8 @@ def main() -> int:
     parser.add_argument("--asset", default="ETH")
     parser.add_argument("--hours", type=float, default=24.0)
     parser.add_argument("--tail", type=int, default=200000)
-    parser.add_argument("--include-rotated", action="store_true")
+    parser.add_argument("--include-rotated", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--current-only", action="store_true")
     parser.add_argument("--log-file", type=Path, default=ORDER_METRICS)
     args = parser.parse_args()
 
@@ -406,7 +407,7 @@ def main() -> int:
         asset=args.asset,
         hours=args.hours,
         limit=args.tail,
-        include_rotated=args.include_rotated,
+        include_rotated=not args.current_only,
     )
     results = analyze_sample_move_blocks(rows, asset=args.asset)
     _print_report(results)

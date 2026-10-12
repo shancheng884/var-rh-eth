@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import gzip
 import os
+import re
 from collections import deque
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -112,18 +113,56 @@ def rotated_jsonl_paths(path: Path) -> list[Path]:
     name = path.name
     if not parent.exists():
         return [path] if path.exists() else []
-    rotated = [item for item in parent.iterdir() if item.name.startswith(name + ".")]
-    def sort_key(item: Path) -> tuple[int, str]:
-        suffix = item.name[len(name) + 1 :]
-        first = suffix.split(".", 1)[0]
-        try:
-            return (int(first), item.name)
-        except ValueError:
-            return (9999, item.name)
-    paths = list(reversed(sorted(rotated, key=sort_key)))
+    candidates = [
+        item
+        for item in parent.iterdir()
+        if item.is_file()
+        and item.name.startswith(name + ".")
+        and not item.name.endswith(".tmp")
+    ]
+    # During compression both forms can briefly coexist; read the verified gzip
+    # archive once instead of counting the raw source and archive twice.
+    selected: dict[str, Path] = {}
+    for item in candidates:
+        logical_name = item.name.removesuffix(".gz")
+        existing = selected.get(logical_name)
+        if existing is None or item.suffix == ".gz":
+            selected[logical_name] = item
+
+    def sort_key(item: Path) -> tuple[float, int, str]:
+        suffix = item.name[len(name) :]
+        segment = re.search(
+            r"\.(?:segment|full)-(\d{8}T\d{6}(?:\d{6})?Z)", suffix
+        )
+        if segment:
+            stamp = segment.group(1)
+            try:
+                fmt = "%Y%m%dT%H%M%S%fZ" if len(stamp) == 22 else "%Y%m%dT%H%M%SZ"
+                observed = datetime.strptime(stamp, fmt).replace(tzinfo=timezone.utc)
+                return (observed.timestamp(), 0, item.name)
+            except ValueError:
+                pass
+        numeric = re.match(r"\.(\d+)(?:\.gz)?$", suffix)
+        if numeric:
+            # RotatingFileHandler names .1 as newest and larger suffixes older.
+            return (item.stat().st_mtime, -int(numeric.group(1)), item.name)
+        return (item.stat().st_mtime, 1, item.name)
+
+    paths = sorted(selected.values(), key=sort_key)
     if path.exists():
         paths.append(path)
     return paths
+
+
+def iter_jsonl_lines(path: Path) -> Iterable[str]:
+    """Yield lines from a JSONL file and its chronological rotated archives."""
+    for source_path in rotated_jsonl_paths(path):
+        try:
+            opener = gzip.open if source_path.suffix == ".gz" else open
+            with opener(source_path, "rt", encoding="utf-8", errors="replace") as handle:
+                yield from handle
+        except FileNotFoundError:
+            continue
 
 
 def tail_jsonl_many(
