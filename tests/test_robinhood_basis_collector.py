@@ -1,6 +1,6 @@
 import asyncio
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -8,6 +8,7 @@ from tools.robinhood_basis_collector import (
     CurrentDayJsonlFollower,
     FixedJsonlFollower,
     RobinhoodBasisCollector,
+    TemporarilyUnavailable,
     parse_args,
 )
 
@@ -341,6 +342,190 @@ def test_collector_rejects_stale_source_sample(tmp_path) -> None:
     asyncio.run(run())
 
 
+def test_rest_book_transient_http_error_backs_off_and_recovers(
+    tmp_path, monkeypatch
+) -> None:
+    import pytest
+    import requests
+
+    class Response:
+        def __init__(self, status_code: int, payload: dict) -> None:
+            self.status_code = status_code
+            self.headers = {}
+            self.payload = payload
+
+        def raise_for_status(self) -> None:
+            if self.status_code >= 400:
+                raise requests.HTTPError(
+                    f"HTTP {self.status_code}", response=self
+                )
+
+        def json(self) -> dict:
+            return self.payload
+
+    async def run() -> None:
+        args = parse_args(
+            [
+                "--source-root",
+                str(tmp_path / "source"),
+                "--output-dir",
+                str(tmp_path / "output"),
+            ]
+        )
+        collector = RobinhoodBasisCollector(args)
+        market = SimpleNamespace(
+            market_id=0, ready=True, resyncing=False, received_monotonic=1.0
+        )
+        collector.books.by_asset["ETH"] = market
+        collector.books.bids = {Decimal("1999"): Decimal("1")}
+        collector.books.asks = {Decimal("2001"): Decimal("1")}
+        collector.books.received_monotonic = 1.0
+
+        responses = [
+            Response(503, {}),
+            Response(
+                200,
+                {
+                    "bids": [{"price": "2000", "size": "2"}],
+                    "asks": [{"price": "2001", "size": "3"}],
+                },
+            ),
+        ]
+        calls = 0
+
+        def fake_get(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            return responses.pop(0)
+
+        monkeypatch.setattr(
+            "tools.robinhood_basis_collector.requests.get", fake_get
+        )
+
+        with pytest.raises(TemporarilyUnavailable):
+            await collector.books._refresh(force=True)
+        assert calls == 1
+        assert collector.books.bids == {}
+        assert collector.books.asks == {}
+        assert collector.books.received_monotonic is None
+        assert market.ready is False
+        assert collector.books.last_error is not None
+
+        with pytest.raises(TemporarilyUnavailable):
+            await collector.books._refresh(force=True)
+        assert calls == 1
+
+        collector.books.next_retry_monotonic = 0
+        await collector.books._refresh(force=True)
+        assert calls == 2
+        assert collector.books.bids == {Decimal("2000"): Decimal("2")}
+        assert collector.books.asks == {Decimal("2001"): Decimal("3")}
+        assert market.ready is True
+        assert collector.books.last_error is None
+        assert collector.books.transient_failures == 0
+
+    asyncio.run(run())
+
+
+def test_rest_book_permanent_http_error_is_not_retried(tmp_path, monkeypatch) -> None:
+    import pytest
+    import requests
+
+    class Response:
+        status_code = 404
+        headers = {}
+
+        @staticmethod
+        def raise_for_status() -> None:
+            raise requests.HTTPError("HTTP 404", response=Response())
+
+    async def run() -> None:
+        args = parse_args(
+            [
+                "--source-root",
+                str(tmp_path / "source"),
+                "--output-dir",
+                str(tmp_path / "output"),
+            ]
+        )
+        collector = RobinhoodBasisCollector(args)
+        collector.books.by_asset["ETH"] = SimpleNamespace(
+            market_id=0, ready=True, resyncing=False, received_monotonic=1.0
+        )
+        calls = 0
+
+        def fake_get(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            return Response()
+
+        monkeypatch.setattr(
+            "tools.robinhood_basis_collector.requests.get", fake_get
+        )
+        with pytest.raises(requests.HTTPError):
+            await collector.books._refresh(force=True)
+        assert calls == 1
+        assert collector.books.transient_failures == 0
+        assert collector.books.next_retry_monotonic == 0
+        assert collector.books.by_asset["ETH"].ready is False
+
+    asyncio.run(run())
+
+
+def test_collector_rejects_source_that_expires_during_book_capture(tmp_path) -> None:
+    async def run() -> None:
+        args = parse_args(
+            [
+                "--source-root",
+                str(tmp_path / "source"),
+                "--output-dir",
+                str(tmp_path / "output"),
+                "--max-source-age-seconds",
+                "0.02",
+            ]
+        )
+        collector = RobinhoodBasisCollector(args)
+        collector.books.by_asset["ETH"] = SimpleNamespace(market_id=0)
+
+        async def slow_snapshot(_asset, notional, *, force_refresh=False):
+            await asyncio.sleep(0.01)
+            price_offset = notional / Decimal("10000")
+            return {
+                "bid": Decimal("1999.9"),
+                "ask": Decimal("2000.1"),
+                "sell_price": Decimal("1999.9") - price_offset,
+                "buy_price": Decimal("2000.1") + price_offset,
+                "nonce": None,
+                "book_age_seconds": 0.01,
+                "continuity_ok": True,
+                "cold": False,
+                "sequence_gaps": 0,
+            }
+
+        collector.books.snapshot = slow_snapshot
+        now = datetime(2026, 8, 25, 0, 0, 1, tzinfo=timezone.utc)
+        row, error = await collector.build_row(
+            {
+                "event": "live_inventory_basis_state",
+                "sample_id": "source-expires-during-capture",
+                "sample_kind": "baseline",
+                "sample_quality": "valid",
+                "logged_at": (now - timedelta(seconds=0.01)).isoformat(),
+                "asset": "ETH",
+                "run_id": "live-run",
+                "sample_index": 1,
+                "var_bid": "2001",
+                "var_ask": "2002",
+            },
+            now=now,
+        )
+
+        assert row is None
+        assert error == "source_sample_stale_at_capture"
+
+    asyncio.run(run())
+
+
 def test_health_file_is_collect_only_and_separate(tmp_path) -> None:
     args = parse_args(
         [
@@ -357,3 +542,5 @@ def test_health_file_is_collect_only_and_separate(tmp_path) -> None:
     assert health["execution_mode"] == "collect_only"
     assert health["venue"] == "robinhood_chain_lighter"
     assert collector.health_path.name == "robinhood_basis_health.json"
+    assert health["book_last_error"] is None
+    assert health["book_retry_at"] is None

@@ -44,6 +44,9 @@ LIGHTER_VENUE_HOSTS = {
     "mainnet_lighter": "mainnet.zklighter.elliot.ai",
 }
 DEFAULT_NOTIONALS = (Decimal("20"), Decimal("40"), Decimal("60"))
+TRANSIENT_HTTP_STATUSES = {408, 425, 429}
+BOOK_RETRY_BASE_SECONDS = 0.5
+BOOK_RETRY_MAX_SECONDS = 30.0
 TRADE_EVENT_SNAPSHOT_EVENTS = {
     "live_inventory_entry_shadow_candidate",
     "live_inventory_entered",
@@ -218,6 +221,12 @@ class RestMarket:
     gaps: int = 0
 
 
+class TemporarilyUnavailable(RuntimeError):
+    def __init__(self, message: str, retry_after_seconds: float) -> None:
+        super().__init__(message)
+        self.retry_after_seconds = max(0.0, retry_after_seconds)
+
+
 class RobinhoodRestBooks:
     """Low-rate public REST snapshots aligned to persisted Variational quotes."""
 
@@ -244,15 +253,99 @@ class RobinhoodRestBooks:
         self.bids: dict[Decimal, Decimal] = {}
         self.asks: dict[Decimal, Decimal] = {}
         self.received_monotonic: float | None = None
+        self.transient_failures = 0
+        self.next_retry_monotonic = 0.0
+        self.next_retry_at: str | None = None
+        self.last_error: str | None = None
+
+    def _invalidate(self, reason: str) -> None:
+        self.bids = {}
+        self.asks = {}
+        self.received_monotonic = None
+        self.last_error = reason
+        market = self.by_asset.get(self.asset)
+        if market is not None:
+            market.ready = False
+            market.resyncing = True
+            market.received_monotonic = None
+
+    @staticmethod
+    def _is_transient_request_error(exc: requests.RequestException) -> bool:
+        if isinstance(exc, (requests.Timeout, requests.ConnectionError)):
+            return True
+        if isinstance(exc, requests.HTTPError):
+            status = getattr(exc.response, "status_code", None)
+            return status in TRANSIENT_HTTP_STATUSES or (
+                status is not None and 500 <= status < 600
+            )
+        return False
+
+    async def _get_json(
+        self,
+        url: str,
+        *,
+        params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        now = time.monotonic()
+        if now < self.next_retry_monotonic:
+            raise TemporarilyUnavailable(
+                self.last_error or "Lighter REST retry is cooling down",
+                self.next_retry_monotonic - now,
+            )
+
+        response = None
+        try:
+            response = await asyncio.to_thread(
+                requests.get,
+                url,
+                params=params,
+                timeout=10,
+            )
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            reason = f"{type(exc).__name__}: {exc}"
+            self._invalidate(reason)
+            if not self._is_transient_request_error(exc):
+                raise
+
+            self.transient_failures += 1
+            backoff = min(
+                BOOK_RETRY_MAX_SECONDS,
+                BOOK_RETRY_BASE_SECONDS
+                * (2 ** min(self.transient_failures - 1, 16)),
+            )
+            retry_after = None
+            if response is not None:
+                try:
+                    retry_after = float(response.headers.get("Retry-After"))
+                except (AttributeError, TypeError, ValueError):
+                    retry_after = None
+            if retry_after is not None and retry_after > 0:
+                backoff = min(BOOK_RETRY_MAX_SECONDS, max(backoff, retry_after))
+            self.next_retry_monotonic = time.monotonic() + backoff
+            self.next_retry_at = (
+                datetime.now(timezone.utc) + timedelta(seconds=backoff)
+            ).isoformat()
+            self.logger.warning(
+                "Lighter REST temporarily unavailable error=%s retry_in_seconds=%.1f",
+                reason,
+                backoff,
+            )
+            raise TemporarilyUnavailable(reason, backoff) from exc
+
+        payload = response.json()
+        was_unavailable = self.last_error is not None
+        self.transient_failures = 0
+        self.next_retry_monotonic = 0.0
+        self.next_retry_at = None
+        self.last_error = None
+        if was_unavailable:
+            self.logger.info("Lighter REST book request recovered url=%s", url)
+        return payload
 
     async def load_markets(self) -> None:
-        response = await asyncio.to_thread(
-            requests.get,
-            self.markets_url,
-            timeout=10,
-        )
-        response.raise_for_status()
-        markets = response.json().get("order_books", [])
+        payload = await self._get_json(self.markets_url)
+        markets = payload.get("order_books", [])
         market = next(
             (
                 item
@@ -320,14 +413,10 @@ class RobinhoodRestBooks:
             ):
                 return
             market = self.by_asset[self.asset]
-            response = await asyncio.to_thread(
-                requests.get,
+            payload = await self._get_json(
                 self.orders_url,
                 params={"market_id": market.market_id, "limit": self.order_limit},
-                timeout=10,
             )
-            response.raise_for_status()
-            payload = response.json()
             bids = self._levels(payload.get("bids", []))
             asks = self._levels(payload.get("asks", []))
             if not bids or not asks:
@@ -350,9 +439,14 @@ class RobinhoodRestBooks:
             try:
                 await self._refresh()
                 return
-            except Exception as exc:
+            except TemporarilyUnavailable as exc:
                 last_error = exc
-                await asyncio.sleep(1.0)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                await asyncio.sleep(min(exc.retry_after_seconds, remaining))
+        if isinstance(last_error, TemporarilyUnavailable):
+            raise last_error
         raise RuntimeError(
             f"Timed out waiting for Lighter REST book: {last_error}"
         )
@@ -512,6 +606,9 @@ class RobinhoodBasisCollector:
             "event_source_path": str(self.event_follower.path),
             "book_ready": bool(book and book.ready),
             "book_sequence_gaps": None if book is None else book.gaps,
+            "book_last_error": self.books.last_error,
+            "book_retry_at": self.books.next_retry_at,
+            "book_consecutive_transient_failures": self.books.transient_failures,
             "uptime_seconds": round(time.monotonic() - self.started_monotonic, 3),
             "disk_free_gb": round(usage.free / 1024**3, 3),
         }
@@ -568,11 +665,14 @@ class RobinhoodBasisCollector:
     ) -> tuple[dict[str, dict[str, Any]] | None, str | None]:
         snapshots: dict[str, dict[str, Any]] = {}
         for index, notional in enumerate(self.notional_ladder):
-            snapshot = await self.books.snapshot(
-                self.asset,
-                notional,
-                force_refresh=force_refresh and index == 0,
-            )
+            try:
+                snapshot = await self.books.snapshot(
+                    self.asset,
+                    notional,
+                    force_refresh=force_refresh and index == 0,
+                )
+            except TemporarilyUnavailable:
+                return None, f"{self.venue_prefix}_book_temporarily_unavailable"
             if snapshot is None:
                 return None, f"{self.venue_prefix}_book_unavailable"
             if snapshot.get("sell_price") is None or snapshot.get("buy_price") is None:
@@ -886,10 +986,31 @@ class RobinhoodBasisCollector:
         }, None
 
     async def run(self) -> None:
-        await self.books.load_markets()
-        book_task = asyncio.create_task(self.books.run())
+        book_task: asyncio.Task[None] | None = None
+        self._write_health()
         try:
-            await self.books.wait_ready(timeout=self.args.ready_timeout_seconds)
+            while not self.stop:
+                try:
+                    await self.books.load_markets()
+                    break
+                except TemporarilyUnavailable as exc:
+                    self._write_health()
+                    await asyncio.sleep(exc.retry_after_seconds)
+            if self.stop:
+                return
+
+            book_task = asyncio.create_task(self.books.run())
+            while not self.stop:
+                try:
+                    await self.books.wait_ready(
+                        timeout=self.args.ready_timeout_seconds
+                    )
+                    break
+                except TemporarilyUnavailable:
+                    self._write_health()
+            if self.stop:
+                return
+
             if not self.args.replay_current_file:
                 self.follower.seek_to_end()
             self.event_follower.seek_to_end()
@@ -913,11 +1034,12 @@ class RobinhoodBasisCollector:
                     if row is None:
                         self.skipped += 1
                         self._count_error(reason or "unknown")
-                        self.logger.warning(
-                            "sample_skipped source_id=%s reason=%s",
-                            identity,
-                            reason,
-                        )
+                        if reason != f"{self.venue_prefix}_book_temporarily_unavailable":
+                            self.logger.warning(
+                                "sample_skipped source_id=%s reason=%s",
+                                identity,
+                                reason,
+                            )
                     else:
                         self.store.append(row)
                         self.samples += 1
@@ -934,11 +1056,12 @@ class RobinhoodBasisCollector:
                     if row is None:
                         self.skipped += 1
                         self._count_error(reason or "unknown")
-                        self.logger.warning(
-                            "event_snapshot_skipped event_id=%s reason=%s",
-                            identity,
-                            reason,
-                        )
+                        if reason != f"{self.venue_prefix}_book_temporarily_unavailable":
+                            self.logger.warning(
+                                "event_snapshot_skipped event_id=%s reason=%s",
+                                identity,
+                                reason,
+                            )
                     else:
                         self.store.append(row)
                         self.samples += 1
@@ -968,8 +1091,9 @@ class RobinhoodBasisCollector:
         finally:
             self.stop = True
             self.books.stop = True
-            book_task.cancel()
-            await asyncio.gather(book_task, return_exceptions=True)
+            if book_task is not None:
+                book_task.cancel()
+                await asyncio.gather(book_task, return_exceptions=True)
             self.store.write_manifests()
             self._write_health()
 
