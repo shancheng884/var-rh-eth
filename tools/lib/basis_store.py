@@ -217,8 +217,24 @@ def read_basis_samples(
     max_total_rows: int | None = None,
     max_total_bytes: int | None = None,
     max_line_bytes: int | None = None,
+    logged_at_from: datetime | None = None,
+    logged_at_before: datetime | None = None,
+    fields: set[str] | frozenset[str] | None = None,
+    depth_ladder_notional_only: bool = False,
     stats: dict[str, int] | None = None,
 ) -> list[dict[str, Any]]:
+    def as_utc(value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+    window_start = as_utc(logged_at_from)
+    window_end = as_utc(logged_at_before)
+    if window_start is not None and window_end is not None and window_start >= window_end:
+        raise ValueError("logged_at_from must be earlier than logged_at_before")
+
     rows: list[dict[str, Any]] = []
     paths_by_asset: dict[str, list[Path]] = {}
     for path in basis_sample_paths(root, asset_filter):
@@ -238,6 +254,9 @@ def read_basis_samples(
     counters = stats if stats is not None else {}
     counters.setdefault("oversized_lines", 0)
     counters.setdefault("evicted_rows", 0)
+    counters.setdefault("files_skipped_outside_time_window", 0)
+    counters.setdefault("files_scanned", 0)
+    counters.setdefault("rows_skipped_outside_time_window", 0)
     for asset_index, asset in enumerate(assets):
         paths = paths_by_asset[asset]
         asset_row_limit = (
@@ -255,8 +274,20 @@ def read_basis_samples(
         asset_rows: deque[tuple[dict[str, Any], int]] = deque()
         retained_bytes = 0
         for path in sorted(paths, key=lambda item: item.name):
+            file_day = None
+            try:
+                file_day = date.fromisoformat(path.name[:10])
+            except ValueError:
+                pass
+            if file_day is not None and (
+                (window_start is not None and file_day < window_start.date())
+                or (window_end is not None and file_day > window_end.date())
+            ):
+                counters["files_skipped_outside_time_window"] += 1
+                continue
             opener = gzip.open if path.suffix == ".gz" else open
             try:
+                counters["files_scanned"] += 1
                 mode = "rb" if max_line_bytes is not None else "rt"
                 kwargs = {} if mode == "rb" else {"encoding": "utf-8", "errors": "replace"}
                 with opener(path, mode, **kwargs) as handle:
@@ -298,6 +329,46 @@ def read_basis_samples(
                             != quote_size_mode_filter
                         ):
                             continue
+                        if window_start is not None or window_end is not None:
+                            raw_logged_at = str(row.get("logged_at") or "")
+                            try:
+                                normalized = (
+                                    raw_logged_at[:-1] + "+00:00"
+                                    if raw_logged_at.endswith("Z")
+                                    else raw_logged_at
+                                )
+                                row_time = datetime.fromisoformat(normalized)
+                                row_time = as_utc(row_time)
+                            except ValueError:
+                                counters["rows_skipped_outside_time_window"] += 1
+                                continue
+                            if (
+                                (window_start is not None and row_time < window_start)
+                                or (window_end is not None and row_time >= window_end)
+                            ):
+                                counters["rows_skipped_outside_time_window"] += 1
+                                continue
+                        if fields is not None:
+                            projected = {key: row[key] for key in fields if key in row}
+                            if (
+                                depth_ladder_notional_only
+                                and "depth_ladder" in fields
+                                and isinstance(row.get("depth_ladder"), list)
+                            ):
+                                first_level = next(
+                                    (
+                                        item
+                                        for item in row["depth_ladder"]
+                                        if isinstance(item, dict)
+                                    ),
+                                    None,
+                                )
+                                projected["depth_ladder"] = (
+                                    [{"notional_usd": first_level.get("notional_usd")}]
+                                    if first_level is not None
+                                    else []
+                                )
+                            row = projected
                         asset_rows.append((row, line_size))
                         retained_bytes += line_size
                         while len(asset_rows) > asset_row_limit or (

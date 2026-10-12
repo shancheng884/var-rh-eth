@@ -3046,7 +3046,7 @@ def test_v4_history_loader_requires_7d_anchor_and_recent_health(tmp_path) -> Non
         }
         for timestamp, edge_bps in sample_rows
     ]
-    (asset_dir / "2026-07-24.jsonl").write_text(
+    (asset_dir / f"{datetime.now(timezone.utc).date().isoformat()}.jsonl").write_text(
         "".join(json.dumps(row) + "\n" for row in rows),
         encoding="utf-8",
     )
@@ -3122,7 +3122,7 @@ def test_v4_history_loader_uses_external_robinhood_anchor_but_not_health(
                 "long_edge_bps": str(-(index % 100)),
             }
         )
-    (asset_dir / "2026-09-25.jsonl").write_text(
+    (asset_dir / f"{datetime.now(timezone.utc).date().isoformat()}.jsonl").write_text(
         "".join(json.dumps(row) + "\n" for row in rows),
         encoding="utf-8",
     )
@@ -3183,7 +3183,7 @@ def test_v4_history_loader_joins_samples_across_long_gap(tmp_path) -> None:
         }
         for timestamp, edge_bps in [*pre_gap, *post_gap]
     ]
-    (asset_dir / "2026-07-24.jsonl").write_text(
+    (asset_dir / f"{datetime.now(timezone.utc).date().isoformat()}.jsonl").write_text(
         "".join(json.dumps(row) + "\n" for row in rows),
         encoding="utf-8",
     )
@@ -3250,7 +3250,7 @@ def test_v4_history_loader_uses_legacy_quote_size_rows_for_anchor(tmp_path) -> N
                 "short_edge_bps": str(edge_bps),
             }
         )
-    (asset_dir / "2026-07-24.jsonl").write_text(
+    (asset_dir / f"{datetime.now(timezone.utc).date().isoformat()}.jsonl").write_text(
         "".join(json.dumps(row) + "\n" for row in rows),
         encoding="utf-8",
     )
@@ -3299,7 +3299,7 @@ def test_v4_history_loader_reports_quote_size_warmup_without_compatible_rows(
         "sample_quality": "valid",
         "short_edge_bps": "10",
     }
-    (asset_dir / "2026-07-24.jsonl").write_text(
+    (asset_dir / f"{datetime.now(timezone.utc).date().isoformat()}.jsonl").write_text(
         json.dumps(row) + "\n",
         encoding="utf-8",
     )
@@ -3345,7 +3345,7 @@ def test_v4_history_loader_does_not_use_legacy_health_during_size_migration(
             ],
         )
     ]
-    (asset_dir / "2026-07-24.jsonl").write_text(
+    (asset_dir / f"{datetime.now(timezone.utc).date().isoformat()}.jsonl").write_text(
         "".join(json.dumps(row) + "\n" for row in rows),
         encoding="utf-8",
     )
@@ -3685,7 +3685,7 @@ def test_v4_history_loader_does_not_authorize_recent_1h_without_7d_anchor(
         }
         for index in range(101)
     ]
-    (asset_dir / "2026-07-24.jsonl").write_text(
+    (asset_dir / f"{datetime.now(timezone.utc).date().isoformat()}.jsonl").write_text(
         "".join(json.dumps(row) + "\n" for row in rows),
         encoding="utf-8",
     )

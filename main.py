@@ -114,6 +114,43 @@ LIVE_INVENTORY_BASIS_V4_ROBINHOOD_SOURCE_MAX_AGE_SECONDS = 90.0
 LIVE_INVENTORY_BASIS_V4_FAST_WINDOW_SECONDS = 86400
 LIVE_INVENTORY_BASIS_V4_MID_WINDOW_SECONDS = 15 * 86400
 LIVE_INVENTORY_BASIS_V4_LONG_WINDOW_SECONDS = 30 * 86400
+LIVE_INVENTORY_BASIS_V4_HISTORY_FIELDS = frozenset(
+    {
+        "logged_at",
+        "venue",
+        "event",
+        "sample_kind",
+        "sample_quality",
+        "execution_mode",
+        "basis_collect_only",
+        "sample_id",
+        "quote_size_mode",
+        "source_age_seconds",
+        "source_var_quote_age_seconds",
+        "source_quote_source",
+        "source_sample_quality_version",
+        "source_sample_pair_valid",
+        "robinhood_lighter_book_age_seconds",
+        "robinhood_lighter_sequence_gaps",
+        "robinhood_lighter_continuity_ok",
+        "robinhood_lighter_market_id",
+        "robinhood_lighter_primary_notional_usd",
+        "depth_ladder",
+        "long_edge_bps",
+        "short_edge_bps",
+        "source_quote_received_at",
+        "source_reference_price",
+        "var_bid",
+        "sample_quality_version",
+        "sample_pair_valid",
+        "quote_source",
+        "var_quote_age_seconds",
+        "lighter_book_age_seconds",
+        "quote_received_at",
+        "source_quote_timestamp",
+        "reference_price",
+    }
+)
 LIVE_INVENTORY_BASIS_V4_HEALTH_WINDOW_SECONDS = 3600
 LIVE_INVENTORY_BASIS_V4_ENTRY_PERCENTILE = Decimal("97.5")
 LIVE_INVENTORY_BASIS_V4_FAST_ENTRY_PERCENTILE = Decimal("95")
@@ -9687,6 +9724,18 @@ class VariationalToLighterRuntime:
         self.live_inventory_basis_v4_projection_cache_by_direction.clear()
         now = datetime.now(timezone.utc).timestamp()
         cutoff = now - LIVE_INVENTORY_BASIS_V4_LONG_WINDOW_SECONDS
+        window_start = datetime.fromtimestamp(cutoff, tz=timezone.utc)
+        window_end = datetime.fromtimestamp(now, tz=timezone.utc)
+        history_load_started = time.monotonic()
+        logger = getattr(self, "logger", None)
+        if logger is not None:
+            logger.info(
+                "live_inventory_basis_v4_history_load_started asset=%s window_start_utc=%s window_end_utc=%s window_seconds=%s",
+                asset.upper(),
+                window_start.isoformat(),
+                window_end.isoformat(),
+                LIVE_INVENTORY_BASIS_V4_LONG_WINDOW_SECONDS,
+            )
         entry_directions = self.live_inventory_basis_v4_entry_directions()
         migration_path = self.output_dir / "basis_v4_migration_fallback.json"
         persisted_migration = read_json(migration_path)
@@ -9712,13 +9761,27 @@ class VariationalToLighterRuntime:
                         self.live_inventory_basis_v4_migration_fallback_by_direction[
                             direction
                         ] = fallback
+        mainnet_read_stats: dict[str, int] = {}
         raw_source_rows = read_basis_samples(
             self.output_dir / "basis_samples",
             limit=100000,
             asset_filter=asset,
             sample_kind_filter="baseline",
             sample_quality_filter="valid",
+            logged_at_from=window_start,
+            logged_at_before=window_end,
+            fields=LIVE_INVENTORY_BASIS_V4_HISTORY_FIELDS,
+            depth_ladder_notional_only=True,
+            stats=mainnet_read_stats,
         )
+        if logger is not None:
+            logger.info(
+                "live_inventory_basis_v4_history_source_read source=variational rows=%s files_scanned=%s files_skipped=%s rows_outside_window=%s",
+                len(raw_source_rows),
+                mainnet_read_stats.get("files_scanned", 0),
+                mainnet_read_stats.get("files_skipped_outside_time_window", 0),
+                mainnet_read_stats.get("rows_skipped_outside_time_window", 0),
+            )
         robinhood_roots = [
             (self.output_dir / "robinhood_basis_samples").resolve()
         ]
@@ -9731,14 +9794,37 @@ class VariationalToLighterRuntime:
                 robinhood_roots.append(external_root)
         robinhood_rows_by_id: dict[str, dict[str, Any]] = {}
         robinhood_rows_without_id: list[dict[str, Any]] = []
+        robinhood_read_stats: dict[str, int] = {
+            "files_scanned": 0,
+            "files_skipped_outside_time_window": 0,
+            "rows_skipped_outside_time_window": 0,
+        }
         for root in robinhood_roots:
-            for row in read_basis_samples(
+            root_stats: dict[str, int] = {}
+            root_rows = read_basis_samples(
                 root,
                 limit=100000,
                 asset_filter=asset,
                 sample_kind_filter="baseline",
                 sample_quality_filter="valid",
-            ):
+                logged_at_from=window_start,
+                logged_at_before=window_end,
+                fields=LIVE_INVENTORY_BASIS_V4_HISTORY_FIELDS,
+                depth_ladder_notional_only=True,
+                stats=root_stats,
+            )
+            for key in robinhood_read_stats:
+                robinhood_read_stats[key] += root_stats.get(key, 0)
+            if logger is not None:
+                logger.info(
+                    "live_inventory_basis_v4_history_source_read source=robinhood root=%s rows=%s files_scanned=%s files_skipped=%s rows_outside_window=%s",
+                    root.name,
+                    len(root_rows),
+                    root_stats.get("files_scanned", 0),
+                    root_stats.get("files_skipped_outside_time_window", 0),
+                    root_stats.get("rows_skipped_outside_time_window", 0),
+                )
+            for row in root_rows:
                 if row.get("venue") != "robinhood_chain_lighter":
                     continue
                 sample_id = str(row.get("sample_id") or "")
@@ -10022,7 +10108,7 @@ class VariationalToLighterRuntime:
                 entry_direction
             ]
         )
-        return {
+        result = {
             "profile": self.live_inventory_basis_v4_profile,
             "entry_direction": entry_direction,
             "entry_directions": list(entry_directions),
@@ -10039,9 +10125,28 @@ class VariationalToLighterRuntime:
             "compatible_source_rows": len(compatible_source_rows),
             "incompatible_quote_size_rows": incompatible_quote_size_rows,
             "quote_size_mode": quote_size_mode,
+            "history_window_start_utc": window_start.isoformat(),
+            "history_window_end_utc": window_end.isoformat(),
+            "history_load_duration_seconds": round(
+                time.monotonic() - history_load_started,
+                3,
+            ),
+            "history_mainnet_read_stats": mainnet_read_stats,
+            "history_robinhood_read_stats": robinhood_read_stats,
             "directions": direction_contexts,
             **primary,
         }
+        if logger is not None:
+            logger.info(
+                "live_inventory_basis_v4_history_load_completed asset=%s rows=%s accepted=%s duration_seconds=%.3f ready=%s reason=%s",
+                asset.upper(),
+                len(raw_source_rows),
+                len(source_rows),
+                result["history_load_duration_seconds"],
+                result.get("ready"),
+                result.get("reason"),
+            )
+        return result
 
     def live_inventory_basis_v4_entry_threshold(
         self,

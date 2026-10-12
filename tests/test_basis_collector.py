@@ -1,6 +1,7 @@
 import asyncio
 import json
 from collections import deque
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
@@ -97,6 +98,90 @@ def test_basis_store_can_read_only_valid_baseline_rows(tmp_path) -> None:
     assert len(rows) == 1
     assert rows[0]["sample_kind"] == "baseline"
     assert rows[0]["sample_quality"] == "valid"
+
+
+@pytest.mark.parametrize("primary_notional", [None, "20", "invalid"])
+def test_basis_reader_filters_time_window_and_projects_history_fields(
+    tmp_path, primary_notional
+) -> None:
+    asset_dir = tmp_path / "ETH"
+    now = datetime.now(timezone.utc)
+    window_start = now - timedelta(days=2)
+    before = now
+    old_at = now - timedelta(days=4)
+    rows_by_day = {
+        old_at.date(): [
+            {
+                "logged_at": old_at.isoformat(),
+                "sample_kind": "baseline",
+                "sample_quality": "valid",
+                "long_edge_bps": "-1",
+                "large_unused_payload": {"levels": list(range(500))},
+            }
+        ],
+        window_start.date(): [
+            {
+                "logged_at": window_start.isoformat(),
+                "sample_kind": "baseline",
+                "sample_quality": "valid",
+                "long_edge_bps": "2",
+                "robinhood_lighter_primary_notional_usd": primary_notional,
+                "depth_ladder": [
+                    {"notional_usd": "20", "unused_levels": list(range(500))},
+                    {"notional_usd": "40"},
+                ],
+                "large_unused_payload": {"levels": list(range(500))},
+            },
+            {
+                "logged_at": before.isoformat(),
+                "sample_kind": "baseline",
+                "sample_quality": "valid",
+                "long_edge_bps": "3",
+            },
+        ],
+    }
+    for day, rows in rows_by_day.items():
+        path = asset_dir / f"{day.isoformat()}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "".join(json.dumps(row) + "\n" for row in rows),
+            encoding="utf-8",
+        )
+
+    stats: dict[str, int] = {}
+    rows = read_basis_samples(
+        tmp_path,
+        limit=10,
+        asset_filter="ETH",
+        sample_kind_filter="baseline",
+        sample_quality_filter="valid",
+        logged_at_from=window_start,
+        logged_at_before=before,
+        fields={
+            "logged_at",
+            "sample_kind",
+            "sample_quality",
+            "long_edge_bps",
+            "robinhood_lighter_primary_notional_usd",
+            "depth_ladder",
+        },
+        depth_ladder_notional_only=True,
+        stats=stats,
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["long_edge_bps"] == "2"
+    assert set(rows[0]) == {
+        "logged_at",
+        "sample_kind",
+        "sample_quality",
+        "long_edge_bps",
+        "robinhood_lighter_primary_notional_usd",
+        "depth_ladder",
+    }
+    assert rows[0]["depth_ladder"] == [{"notional_usd": "20"}]
+    assert stats["files_skipped_outside_time_window"] == 1
+    assert stats["rows_skipped_outside_time_window"] == 1
 
 
 def test_legacy_archive_preserves_content_and_reopens_active_file(tmp_path) -> None:
