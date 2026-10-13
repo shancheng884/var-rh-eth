@@ -5179,6 +5179,47 @@ def test_basis_quote_uses_exact_base_qty_and_records_quote_size_mode(tmp_path) -
     asyncio.run(run())
 
 
+def test_diagnostic_basis_quote_failure_does_not_change_runtime_health_state(
+    tmp_path,
+) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_inventory_extension_disconnect_failures = 2
+        runtime.live_inventory_extension_failure_started_monotonic = 123.0
+        recorder_calls: list[dict[str, object]] = []
+        send_calls: list[dict[str, object]] = []
+
+        async def fake_send_variational_place_order(**kwargs):
+            send_calls.append(kwargs)
+            return {
+                "ok": False,
+                "error": "no extension command client connected",
+            }
+
+        async def capture_quote_failure(**kwargs):
+            recorder_calls.append(kwargs)
+
+        runtime.send_variational_place_order = fake_send_variational_place_order
+        runtime.record_live_inventory_basis_quote_failure = (
+            capture_quote_failure
+        )
+        quote, elapsed_ms = await runtime.fetch_live_inventory_basis_quote(
+            asset="ETH",
+            qty=Decimal("0.008"),
+            priority="background",
+            diagnostic_only=True,
+        )
+
+        assert quote is None
+        assert elapsed_ms is None
+        assert send_calls[0]["diagnostic_only"] is True
+        assert recorder_calls == []
+        assert runtime.live_inventory_extension_disconnect_failures == 2
+        assert runtime.live_inventory_extension_failure_started_monotonic == 123.0
+
+    asyncio.run(run())
+
+
 def test_basis_quote_prefers_most_common_exact_open_lot_qty(tmp_path) -> None:
     runtime = _live_inventory_runtime(tmp_path)
     runtime.live_allowed_assets = {"ETH"}
@@ -7053,6 +7094,265 @@ def test_live_inventory_basis_refreshed_exit_context_uses_lighter_depth(
         assert context["executable_pnl_bps"] == Decimal("20.000")
         assert context["executable_lighter_exit_price"] == Decimal("100.1")
         assert context["refresh_quote_ms"] == Decimal("12")
+
+    asyncio.run(run())
+
+
+def test_v4_exit_shadow_probe_requires_two_fresh_independent_executable_quotes(
+    tmp_path,
+) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_inventory_basis_max_var_quote_age_ms = 1500
+        runtime.live_inventory_max_lighter_book_age_seconds = 2.0
+        contexts = [
+            Decimal("4.8"),
+            Decimal("4.9"),
+            Decimal("4.7"),
+        ]
+        calls: list[dict[str, object]] = []
+        logged: list[tuple[str, dict[str, object]]] = []
+
+        async def fake_refreshed_exit_context(**kwargs):
+            calls.append(kwargs)
+            pnl_bps = contexts.pop(0)
+            attempt = len(calls)
+            return {
+                "reason": None,
+                "quote_id": f"quote-{attempt}",
+                "quote_timestamp": datetime.now(timezone.utc).isoformat(),
+                "refreshed_pnl_bps": pnl_bps,
+                "executable_pnl_bps": pnl_bps,
+                "exit_lighter_depth": {
+                    "book_age_seconds": 0.05,
+                    "book_depth_sufficient": True,
+                },
+            }
+
+        async def capture_log(event, payload):
+            logged.append((event, payload))
+
+        runtime.live_inventory_basis_refreshed_exit_context = (
+            fake_refreshed_exit_context
+        )
+        runtime.append_live_inventory_log = capture_log
+        await runtime.live_inventory_basis_v4_run_exit_shadow_probe(
+            asset="ETH",
+            candidate={
+                "lot_id": 9,
+                "direction": "short_var_long_lighter",
+                "qty": "0.008",
+                "entry_var_price": "100",
+                "entry_lighter_price": "100",
+                "exit_lighter_side": "SELL",
+                "passive_pnl_bps": "6.0",
+                "effective_min_exit_pnl_bps": "4.5",
+            },
+            state_payload={"run_id": "test-run"},
+        )
+
+        assert len(calls) == 3
+        assert all(call["priority"] == "background" for call in calls)
+        assert all(call["rfq_category"] == "profit_exit_rfq" for call in calls)
+        assert len(logged) == 1
+        event, payload = logged[0]
+        assert event == "live_inventory_v4_exit_shadow_probe"
+        assert payload["probe_mode"] == "verification_only"
+        assert payload["would_submit_order"] is False
+        assert payload["probe_confirmation_passed"] is True
+        assert payload["independent_eligible_quotes"] == 3
+        assert payload["observations"][-1]["qualifies"] is True
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("quote_ids", "executable_values", "expected_reason"),
+    [
+        (
+            ("same", "same", "same"),
+            (Decimal("4.8"), Decimal("4.9"), Decimal("4.7")),
+            "fewer_than_two_independent_executable_quotes",
+        ),
+        (
+            ("one", "two", "three"),
+            (Decimal("4.8"), Decimal("4.9"), Decimal("4.4")),
+            "latest_quote_not_eligible",
+        ),
+    ],
+)
+def test_v4_exit_shadow_probe_rejects_duplicate_or_falling_latest_quote(
+    tmp_path,
+    quote_ids,
+    executable_values,
+    expected_reason,
+) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_inventory_basis_max_var_quote_age_ms = 1500
+        runtime.live_inventory_max_lighter_book_age_seconds = 2.0
+        contexts = iter(zip(quote_ids, executable_values))
+        logged: list[tuple[str, dict[str, object]]] = []
+
+        async def fake_refreshed_exit_context(**_kwargs):
+            quote_id, pnl_bps = next(contexts)
+            return {
+                "reason": None,
+                "quote_id": quote_id,
+                "quote_timestamp": datetime.now(timezone.utc).isoformat(),
+                "refreshed_pnl_bps": pnl_bps,
+                "executable_pnl_bps": pnl_bps,
+                "exit_lighter_depth": {
+                    "book_age_seconds": 0.05,
+                    "book_depth_sufficient": True,
+                },
+            }
+
+        async def capture_log(event, payload):
+            logged.append((event, payload))
+
+        runtime.live_inventory_basis_refreshed_exit_context = (
+            fake_refreshed_exit_context
+        )
+        runtime.append_live_inventory_log = capture_log
+        await runtime.live_inventory_basis_v4_run_exit_shadow_probe(
+            asset="ETH",
+            candidate={
+                "lot_id": 9,
+                "direction": "short_var_long_lighter",
+                "qty": "0.008",
+                "entry_var_price": "100",
+                "entry_lighter_price": "100",
+                "exit_lighter_side": "SELL",
+                "passive_pnl_bps": "6.0",
+                "effective_min_exit_pnl_bps": "4.5",
+            },
+            state_payload={"run_id": "test-run"},
+        )
+
+        payload = logged[0][1]
+        assert payload["probe_confirmation_passed"] is False
+        assert payload["result_reason"] == expected_reason
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("stale_var", "full_depth", "expected_observation_reason"),
+    [
+        (True, True, "variational_rfq_stale_or_timestamp_missing"),
+        (False, False, "lighter_full_size_depth_unavailable"),
+    ],
+)
+def test_v4_exit_shadow_probe_rejects_stale_or_partial_execution_data(
+    tmp_path,
+    stale_var,
+    full_depth,
+    expected_observation_reason,
+) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_inventory_basis_max_var_quote_age_ms = 1500
+        runtime.live_inventory_max_lighter_book_age_seconds = 2.0
+        logged: list[tuple[str, dict[str, object]]] = []
+        call_count = 0
+
+        async def fake_refreshed_exit_context(**_kwargs):
+            nonlocal call_count
+            call_count += 1
+            return {
+                "reason": None,
+                "quote_id": f"quote-{call_count}",
+                "quote_timestamp": (
+                    "2000-01-01T00:00:00Z"
+                    if stale_var
+                    else datetime.now(timezone.utc).isoformat()
+                ),
+                "refreshed_pnl_bps": Decimal("4.8"),
+                "executable_pnl_bps": Decimal("4.8"),
+                "exit_lighter_depth": {
+                    "book_age_seconds": 0.05,
+                    "book_depth_sufficient": full_depth,
+                },
+            }
+
+        async def capture_log(event, payload):
+            logged.append((event, payload))
+
+        runtime.live_inventory_basis_refreshed_exit_context = (
+            fake_refreshed_exit_context
+        )
+        runtime.append_live_inventory_log = capture_log
+        await runtime.live_inventory_basis_v4_run_exit_shadow_probe(
+            asset="ETH",
+            candidate={
+                "lot_id": 9,
+                "direction": "short_var_long_lighter",
+                "qty": "0.008",
+                "entry_var_price": "100",
+                "entry_lighter_price": "100",
+                "exit_lighter_side": "SELL",
+                "passive_pnl_bps": "6.0",
+                "effective_min_exit_pnl_bps": "4.5",
+            },
+            state_payload={"run_id": "test-run"},
+        )
+
+        payload = logged[0][1]
+        assert payload["probe_confirmation_passed"] is False
+        assert all(
+            observation["reason"] == expected_observation_reason
+            for observation in payload["observations"]
+        )
+
+    asyncio.run(run())
+
+
+def test_v4_exit_shadow_probe_scheduler_chooses_one_best_candidate_and_cools_down(
+    tmp_path,
+) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.mode = "live"
+        runtime.live_inventory_v4_exit_shadow_probe_enabled = True
+        selected: list[dict[str, object]] = []
+
+        async def capture_probe(*, asset, candidate, state_payload):
+            selected.append(candidate)
+
+        runtime.live_inventory_basis_v4_run_exit_shadow_probe = capture_probe
+        candidates = [
+            {
+                "lot_id": 2,
+                "qty": "0.008",
+                "entry_var_price": "100",
+                "entry_lighter_price": "100",
+                "passive_pnl_bps": "5.1",
+                "effective_min_exit_pnl_bps": "4.5",
+            },
+            {
+                "lot_id": 3,
+                "qty": "0.008",
+                "entry_var_price": "100",
+                "entry_lighter_price": "100",
+                "passive_pnl_bps": "6.2",
+                "effective_min_exit_pnl_bps": "4.5",
+            },
+        ]
+
+        assert runtime.live_inventory_basis_v4_maybe_start_exit_shadow_probe(
+            asset="ETH",
+            candidates=candidates,
+            state_payload={"run_id": "test-run"},
+        ) is True
+        await runtime.live_inventory_v4_exit_shadow_probe_task
+        assert len(selected) == 1
+        assert selected[0]["lot_id"] == 3
+        assert runtime.live_inventory_basis_v4_maybe_start_exit_shadow_probe(
+            asset="ETH",
+            candidates=candidates,
+            state_payload={"run_id": "test-run"},
+        ) is False
 
     asyncio.run(run())
 

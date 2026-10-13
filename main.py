@@ -204,6 +204,12 @@ LIVE_INVENTORY_BASIS_V4_EXIT_CALIBRATION_STRATEGY_VERSIONS = frozenset(
 LIVE_INVENTORY_BASIS_V4_NET_EXIT_TARGET_BPS = Decimal("1")
 LIVE_INVENTORY_BASIS_V4_EXIT_CONFIRM_SAMPLES = 2
 LIVE_INVENTORY_BASIS_V4_EXIT_CONFIRM_WINDOW_SAMPLES = 3
+LIVE_INVENTORY_BASIS_V4_EXIT_SHADOW_PROBE_ATTEMPTS = 3
+LIVE_INVENTORY_BASIS_V4_EXIT_SHADOW_PROBE_INTERVAL_SECONDS = 0.20
+LIVE_INVENTORY_BASIS_V4_EXIT_SHADOW_PROBE_TIMEOUT_SECONDS = 1.0
+LIVE_INVENTORY_BASIS_V4_EXIT_SHADOW_PROBE_COOLDOWN_SECONDS = 30.0
+LIVE_INVENTORY_BASIS_V4_EXIT_SHADOW_PROBE_MAX_VAR_QUOTE_AGE_MS = 1500.0
+LIVE_INVENTORY_BASIS_V4_EXIT_SHADOW_PROBE_MAX_BOOK_AGE_SECONDS = 2.0
 LIVE_INVENTORY_BASIS_V4_EXIT_STRONG_SINGLE_MARGIN_BPS = Decimal("1.00")
 LIVE_INVENTORY_BASIS_V4_EXIT_STRONG_SINGLE_STABILITY_SAMPLES = 2
 LIVE_INVENTORY_BASIS_V4_EXIT_STRONG_SINGLE_MAX_RANGE_BPS = Decimal("1.50")
@@ -2690,6 +2696,7 @@ class VariationalToLighterRuntime:
         self.live_inventory_v4_shadow_tranches: dict[str, dict[str, Any]] = {}
         self.live_inventory_v4_shadow_completed_keys: set[str] = set()
         self.live_inventory_v4_shadow_completed_episode_id: str | None = None
+        self.live_inventory_v4_exit_shadow_probe_enabled = True
         self.live_inventory_v4_strong_single_enabled = True
         self.live_inventory_v4_strong_single_disabled_reason: str | None = None
         self.live_inventory_v4_strong_single_disabled_at: str | None = None
@@ -10939,12 +10946,20 @@ class VariationalToLighterRuntime:
         entry_var_price: Decimal,
         entry_lighter_price: Decimal,
         exit_lighter_side: str,
+        priority: str = "trade",
+        rfq_category: str = "profit_exit_rfq",
+        diagnostic_only: bool = False,
     ) -> dict[str, Any]:
-        refreshed_quote, refresh_quote_ms = await self.fetch_live_inventory_basis_quote(
-            asset=asset,
-            qty=qty,
-            priority="trade",
-            rfq_category="profit_exit_rfq",
+        quote_request = {
+            "asset": asset,
+            "qty": qty,
+            "priority": priority,
+            "rfq_category": rfq_category,
+        }
+        if diagnostic_only:
+            quote_request["diagnostic_only"] = True
+        refreshed_quote, refresh_quote_ms = (
+            await self.fetch_live_inventory_basis_quote(**quote_request)
         )
         refreshed_var_bid = (
             to_decimal(refreshed_quote.get("bid")) if refreshed_quote else None
@@ -11256,6 +11271,322 @@ class VariationalToLighterRuntime:
             "strong_single_threshold_bps": strong_single_threshold_bps,
             "strong_single_context": strong_single_context,
         }
+
+    def live_inventory_basis_v4_maybe_start_exit_shadow_probe(
+        self,
+        *,
+        asset: str,
+        candidates: list[dict[str, Any]],
+        state_payload: dict[str, Any],
+    ) -> bool:
+        if (
+            not candidates
+            or not getattr(
+                self, "live_inventory_v4_exit_shadow_probe_enabled", False
+            )
+            or getattr(self, "mode", None) != "live"
+            or getattr(self, "live_inventory_dry_decisions", False)
+            or getattr(self, "stop_flag", False)
+            or getattr(self, "live_inventory_maintenance_drain_requested", False)
+        ):
+            return False
+        task = getattr(self, "live_inventory_v4_exit_shadow_probe_task", None)
+        if task is not None and not task.done():
+            return False
+        now = time.monotonic()
+        last_started = float(
+            getattr(
+                self,
+                "live_inventory_v4_exit_shadow_probe_last_started_monotonic",
+                0.0,
+            )
+            or 0.0
+        )
+        if last_started > 0 and (
+            now - last_started
+            < LIVE_INVENTORY_BASIS_V4_EXIT_SHADOW_PROBE_COOLDOWN_SECONDS
+        ):
+            return False
+        candidate = max(
+            candidates,
+            key=lambda item: to_decimal(item.get("passive_pnl_bps"))
+            or Decimal("-Infinity"),
+        )
+        candidate_qty = to_decimal(candidate.get("qty"))
+        candidate_target = to_decimal(
+            candidate.get("effective_min_exit_pnl_bps")
+        )
+        if (
+            candidate_qty is None
+            or candidate_qty <= 0
+            or candidate_target is None
+            or candidate_target < 0
+            or to_decimal(candidate.get("entry_var_price")) is None
+            or to_decimal(candidate.get("entry_lighter_price")) is None
+        ):
+            return False
+        self.live_inventory_v4_exit_shadow_probe_last_started_monotonic = now
+        self.live_inventory_v4_exit_shadow_probe_task = asyncio.create_task(
+            self.live_inventory_basis_v4_run_exit_shadow_probe(
+                asset=asset,
+                candidate=dict(candidate),
+                state_payload=dict(state_payload),
+            ),
+            name="live-inventory-v4-exit-shadow-probe",
+        )
+        self.live_inventory_v4_exit_shadow_probe_task.add_done_callback(
+            self.live_inventory_basis_v4_exit_shadow_probe_task_done
+        )
+        return True
+
+    def live_inventory_basis_v4_exit_shadow_probe_task_done(
+        self, task: asyncio.Task[Any]
+    ) -> None:
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            self.logger.error(
+                "live_inventory_v4_exit_shadow_probe_failed",
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
+
+    async def live_inventory_basis_v4_run_exit_shadow_probe(
+        self,
+        *,
+        asset: str,
+        candidate: dict[str, Any],
+        state_payload: dict[str, Any],
+    ) -> None:
+        started = time.monotonic()
+        deadline = (
+            started
+            + LIVE_INVENTORY_BASIS_V4_EXIT_SHADOW_PROBE_TIMEOUT_SECONDS
+        )
+        seen_quote_ids: set[str] = set()
+        observations: list[dict[str, Any]] = []
+        independent_eligible_quotes = 0
+        stop_reason: str | None = None
+        qty = to_decimal(candidate.get("qty")) or Decimal("0")
+        target_bps = to_decimal(
+            candidate.get("effective_min_exit_pnl_bps")
+        ) or Decimal("0")
+
+        for attempt in range(
+            1, LIVE_INVENTORY_BASIS_V4_EXIT_SHADOW_PROBE_ATTEMPTS + 1
+        ):
+            remaining_seconds = deadline - time.monotonic()
+            if remaining_seconds <= 0:
+                stop_reason = "probe_time_budget_exhausted"
+                break
+            try:
+                context = await asyncio.wait_for(
+                    self.live_inventory_basis_refreshed_exit_context(
+                        asset=asset,
+                        direction=str(candidate.get("direction") or ""),
+                        qty=qty,
+                        entry_var_price=to_decimal(
+                            candidate.get("entry_var_price")
+                        )
+                        or Decimal("0"),
+                        entry_lighter_price=to_decimal(
+                            candidate.get("entry_lighter_price")
+                        )
+                        or Decimal("0"),
+                        exit_lighter_side=str(
+                            candidate.get("exit_lighter_side") or ""
+                        ),
+                        priority="background",
+                        rfq_category="profit_exit_rfq",
+                        diagnostic_only=True,
+                    ),
+                    timeout=remaining_seconds,
+                )
+            except asyncio.TimeoutError:
+                observations.append(
+                    {
+                        "attempt": attempt,
+                        "qualifies": False,
+                        "reason": "probe_time_budget_exhausted",
+                    }
+                )
+                stop_reason = "probe_time_budget_exhausted"
+                break
+            except Exception as exc:
+                observations.append(
+                    {
+                        "attempt": attempt,
+                        "qualifies": False,
+                        "reason": f"probe_error:{type(exc).__name__}",
+                    }
+                )
+                stop_reason = f"probe_error:{type(exc).__name__}"
+                break
+
+            depth = context.get("exit_lighter_depth") or {}
+            quote_id = str(context.get("quote_id") or "").strip()
+            quote_timestamp = context.get("quote_timestamp")
+            executable_pnl_bps = to_decimal(
+                context.get("executable_pnl_bps")
+            )
+            book_age_seconds = to_decimal(depth.get("book_age_seconds"))
+            max_book_age_seconds = float(
+                getattr(self, "live_inventory_max_lighter_book_age_seconds", 0.0)
+                or 0.0
+            )
+            if max_book_age_seconds <= 0:
+                max_book_age_seconds = (
+                    LIVE_INVENTORY_BASIS_V4_EXIT_SHADOW_PROBE_MAX_BOOK_AGE_SECONDS
+                )
+            var_quote_fresh = False
+            var_quote_age_seconds: float | None = None
+            if quote_timestamp:
+                (
+                    var_quote_fresh,
+                    var_quote_age_seconds,
+                    _,
+                ) = self.live_inventory_var_quote_freshness(
+                    {
+                        "quote_source": "direct_rfq",
+                        "quoteTimestamp": quote_timestamp,
+                    }
+                )
+            max_var_quote_age_ms = float(
+                getattr(self, "live_inventory_basis_max_var_quote_age_ms", 0.0)
+                or 0.0
+            )
+            if max_var_quote_age_ms <= 0:
+                max_var_quote_age_ms = (
+                    LIVE_INVENTORY_BASIS_V4_EXIT_SHADOW_PROBE_MAX_VAR_QUOTE_AGE_MS
+                )
+            var_quote_fresh = bool(
+                var_quote_fresh
+                and var_quote_age_seconds is not None
+                and var_quote_age_seconds >= 0
+                and var_quote_age_seconds * 1000.0 <= max_var_quote_age_ms
+            )
+            book_fresh = bool(
+                book_age_seconds is not None
+                and book_age_seconds >= 0
+                and (
+                    max_book_age_seconds <= 0
+                    or float(book_age_seconds) <= max_book_age_seconds
+                )
+            )
+
+            reason: str | None = context.get("reason")
+            independent_quote = bool(quote_id and quote_id not in seen_quote_ids)
+            if quote_id:
+                seen_quote_ids.add(quote_id)
+            if reason is None and not quote_id:
+                reason = "quote_identity_missing"
+            elif reason is None and not independent_quote:
+                reason = "duplicate_quote_identity"
+            elif reason is None and not var_quote_fresh:
+                reason = "variational_rfq_stale_or_timestamp_missing"
+            elif reason is None and not book_fresh:
+                reason = "lighter_book_stale_or_timestamp_missing"
+            elif reason is None and depth.get("book_depth_sufficient") is not True:
+                reason = "lighter_full_size_depth_unavailable"
+            elif reason is None and (
+                executable_pnl_bps is None
+                or executable_pnl_bps < target_bps
+            ):
+                reason = "executable_pnl_below_target"
+            qualifies = reason is None
+            if qualifies:
+                independent_eligible_quotes += 1
+            observations.append(
+                {
+                    "attempt": attempt,
+                    "quote_id": quote_id or None,
+                    "quote_timestamp": quote_timestamp,
+                    "independent_quote": independent_quote,
+                    "variational_quote_age_seconds": (
+                        None
+                        if var_quote_age_seconds is None
+                        else round(var_quote_age_seconds, 6)
+                    ),
+                    "lighter_book_age_seconds": decimal_to_str(
+                        book_age_seconds
+                    ),
+                    "lighter_book_depth_sufficient": depth.get(
+                        "book_depth_sufficient"
+                    ),
+                    "refreshed_pnl_bps": decimal_to_str(
+                        context.get("refreshed_pnl_bps")
+                    ),
+                    "executable_pnl_bps": decimal_to_str(
+                        executable_pnl_bps
+                    ),
+                    "target_bps": decimal_to_str(target_bps),
+                    "qualifies": qualifies,
+                    "reason": reason,
+                }
+            )
+            if reason is not None and context.get("reason") is not None:
+                stop_reason = str(context.get("reason"))
+                break
+            if attempt < LIVE_INVENTORY_BASIS_V4_EXIT_SHADOW_PROBE_ATTEMPTS:
+                remaining_seconds = deadline - time.monotonic()
+                if remaining_seconds <= 0:
+                    stop_reason = "probe_time_budget_exhausted"
+                    break
+                await asyncio.sleep(
+                    min(
+                        LIVE_INVENTORY_BASIS_V4_EXIT_SHADOW_PROBE_INTERVAL_SECONDS,
+                        remaining_seconds,
+                    )
+                )
+
+        latest_qualifies = bool(
+            observations and observations[-1].get("qualifies")
+        )
+        probe_confirmation_passed = bool(
+            independent_eligible_quotes >= 2 and latest_qualifies
+        )
+        if probe_confirmation_passed:
+            result_reason = "independent_executable_quotes_confirmed"
+        elif stop_reason:
+            result_reason = stop_reason
+        elif independent_eligible_quotes < 2:
+            result_reason = "fewer_than_two_independent_executable_quotes"
+        elif not latest_qualifies:
+            result_reason = "latest_quote_not_eligible"
+        else:
+            result_reason = "fewer_than_two_independent_executable_quotes"
+
+        try:
+            await self.append_live_inventory_log(
+                "live_inventory_v4_exit_shadow_probe",
+                {
+                    **state_payload,
+                    "probe_mode": "verification_only",
+                    "would_submit_order": False,
+                    "lot_id": candidate.get("lot_id"),
+                    "direction": candidate.get("direction"),
+                    "qty": decimal_to_str(qty),
+                    "passive_signal_pnl_bps": candidate.get(
+                        "passive_pnl_bps"
+                    ),
+                    "target_bps": decimal_to_str(target_bps),
+                    "attempts": len(observations),
+                    "independent_eligible_quotes": independent_eligible_quotes,
+                    "latest_quote_eligible": latest_qualifies,
+                    "probe_confirmation_passed": probe_confirmation_passed,
+                    "result_reason": result_reason,
+                    "elapsed_ms": round(
+                        (time.monotonic() - started) * 1000.0, 3
+                    ),
+                    "observations": observations,
+                },
+            )
+        except Exception:
+            self.logger.exception(
+                "live_inventory_v4_exit_shadow_probe_log_failed lot_id=%s",
+                candidate.get("lot_id"),
+            )
 
     async def live_inventory_basis_size_ladder_context(
         self,
@@ -11738,37 +12069,43 @@ class VariationalToLighterRuntime:
         qty: Decimal,
         priority: str = "trade",
         rfq_category: str = "execution_quote",
+        diagnostic_only: bool = False,
     ) -> tuple[dict[str, Any] | None, Decimal | None]:
         requested_qty = Decimal(str(qty))
         if requested_qty <= 0:
-            await self.record_live_inventory_basis_quote_failure(
-                asset=asset,
-                error="invalid_requested_qty",
-                failure_kind="invalid_request",
-            )
+            if not diagnostic_only:
+                await self.record_live_inventory_basis_quote_failure(
+                    asset=asset,
+                    error="invalid_requested_qty",
+                    failure_kind="invalid_request",
+                )
             return None, None
         try:
-            result, elapsed_ms = await self._timed_submit(
-                self.send_variational_place_order(
+            order_request = {
+                "asset": asset,
+                "side": "BUY",
+                "amount": variational_api_amount_to_str(
+                    requested_qty,
                     asset=asset,
-                    side="BUY",
-                    amount=variational_api_amount_to_str(
-                        requested_qty,
-                        asset=asset,
-                    ),
-                    expected_min_btc_qty=None,
-                    confirm=False,
-                    reduce_only=False,
-                    priority=priority,
-                    rfq_category=rfq_category,
-                )
+                ),
+                "expected_min_btc_qty": None,
+                "confirm": False,
+                "reduce_only": False,
+                "priority": priority,
+                "rfq_category": rfq_category,
+            }
+            if diagnostic_only:
+                order_request["diagnostic_only"] = True
+            result, elapsed_ms = await self._timed_submit(
+                self.send_variational_place_order(**order_request)
             )
         except Exception as exc:
-            await self.record_live_inventory_basis_quote_failure(
-                asset=asset,
-                error=f"quote_request_exception:{type(exc).__name__}:{exc}",
-                failure_kind="request_exception",
-            )
+            if not diagnostic_only:
+                await self.record_live_inventory_basis_quote_failure(
+                    asset=asset,
+                    error=f"quote_request_exception:{type(exc).__name__}:{exc}",
+                    failure_kind="request_exception",
+                )
             return None, None
         if result.get("background_timeout"):
             now = time.monotonic()
@@ -11808,12 +12145,13 @@ class VariationalToLighterRuntime:
                 )
             return None, None
         if not result.get("ok"):
-            await self.record_live_inventory_basis_quote_failure(
-                asset=asset,
-                error=result.get("error") or result.get("step") or "unknown",
-                failure_kind="command_rejected",
-                result=result,
-            )
+            if not diagnostic_only:
+                await self.record_live_inventory_basis_quote_failure(
+                    asset=asset,
+                    error=result.get("error") or result.get("step") or "unknown",
+                    failure_kind="command_rejected",
+                    result=result,
+                )
             return None, None
         payload = result.get("result") if isinstance(result.get("result"), dict) else result
         payload = {
@@ -11836,15 +12174,17 @@ class VariationalToLighterRuntime:
         bid = to_decimal(payload.get("bid"))
         ask = to_decimal(payload.get("ask"))
         if bid is None or ask is None or bid <= 0 or ask <= 0:
-            await self.record_live_inventory_basis_quote_failure(
-                asset=asset,
-                error="missing_or_invalid_bid_ask",
-                failure_kind="invalid_quote",
-                result=result,
-            )
+            if not diagnostic_only:
+                await self.record_live_inventory_basis_quote_failure(
+                    asset=asset,
+                    error="missing_or_invalid_bid_ask",
+                    failure_kind="invalid_quote",
+                    result=result,
+                )
             return None, None
-        self.live_inventory_extension_disconnect_failures = 0
-        self.live_inventory_extension_failure_started_monotonic = 0.0
+        if not diagnostic_only:
+            self.live_inventory_extension_disconnect_failures = 0
+            self.live_inventory_extension_failure_started_monotonic = 0.0
         return payload, Decimal(str(elapsed_ms))
 
     async def get_variational_reference_quote(
@@ -15082,6 +15422,7 @@ class VariationalToLighterRuntime:
         reuse_quote_id: str | None = None,
         priority: str = "trade",
         rfq_category: str = "execution_quote",
+        diagnostic_only: bool = False,
     ) -> dict[str, Any]:
         limiter = self.live_inventory_order_limiter("variational")
         urgent = bool(reduce_only and confirm)
@@ -15174,10 +15515,11 @@ class VariationalToLighterRuntime:
                     timeout=LIVE_INVENTORY_VARIATIONAL_BACKGROUND_COMMAND_TIMEOUT_SECONDS,
                 )
             except asyncio.TimeoutError:
-                self.live_inventory_basis_background_quote_cooldown_until_monotonic = (
-                    time.monotonic()
-                    + LIVE_INVENTORY_VARIATIONAL_BACKGROUND_QUOTE_COOLDOWN_SECONDS
-                )
+                if not diagnostic_only:
+                    self.live_inventory_basis_background_quote_cooldown_until_monotonic = (
+                        time.monotonic()
+                        + LIVE_INVENTORY_VARIATIONAL_BACKGROUND_QUOTE_COOLDOWN_SECONDS
+                    )
                 return {
                     "ok": False,
                     "step": "command_timeout",
@@ -15213,10 +15555,11 @@ class VariationalToLighterRuntime:
                     "execution_unknown": True,
                 }
         if priority == "background" and self.live_inventory_command_timed_out(result):
-            self.live_inventory_basis_background_quote_cooldown_until_monotonic = (
-                time.monotonic()
-                + LIVE_INVENTORY_VARIATIONAL_BACKGROUND_QUOTE_COOLDOWN_SECONDS
-            )
+            if not diagnostic_only:
+                self.live_inventory_basis_background_quote_cooldown_until_monotonic = (
+                    time.monotonic()
+                    + LIVE_INVENTORY_VARIATIONAL_BACKGROUND_QUOTE_COOLDOWN_SECONDS
+                )
             if isinstance(result, dict):
                 result = {
                     **result,
@@ -23659,6 +24002,7 @@ class VariationalToLighterRuntime:
                 )
             )
         selected_exit: dict[str, Any] | None = None
+        exit_shadow_probe_candidates: list[dict[str, Any]] = []
         for lot_index, candidate_lot in enumerate(self.live_inventory_open_lots):
             if atomic_portfolio_lot is not None:
                 if lot_index != atomic_portfolio_lot_index:
@@ -23921,6 +24265,31 @@ class VariationalToLighterRuntime:
                             eligible=passive_quote_eligible,
                         )
                     )
+                    if passive_quote_eligible and confirmation_count == 1:
+                        exit_shadow_probe_candidates.append(
+                            {
+                                "lot_id": candidate_lot.get("lot_id"),
+                                "direction": direction,
+                                "qty": decimal_to_str(qty),
+                                "entry_var_price": decimal_to_str(
+                                    entry_var_price
+                                ),
+                                "entry_lighter_price": decimal_to_str(
+                                    entry_lighter_price
+                                ),
+                                "exit_lighter_side": (
+                                    "BUY"
+                                    if direction
+                                    == DIRECTION_LONG_VAR_SHORT_LIGHTER
+                                    else "SELL"
+                                ),
+                                "passive_pnl_bps": decimal_to_str(pnl_bps),
+                                "effective_min_exit_pnl_bps": decimal_to_str(
+                                    effective_min_exit_pnl_bps
+                                ),
+                                "confirmation_count": confirmation_count,
+                            }
+                        )
                     if passive_quote_eligible and not should_exit and (
                         self.should_log_live_inventory_exit_blocked(
                             lot_id=candidate_lot.get("lot_id"),
@@ -24126,6 +24495,12 @@ class VariationalToLighterRuntime:
                 selected_pnl_bps = selected_exit.get("pnl_bps") if selected_exit is not None else None
                 if selected_exit is None or (pnl_bps is not None and (selected_pnl_bps is None or pnl_bps > selected_pnl_bps)):
                     selected_exit = candidate_exit
+        if selected_exit is None and exit_shadow_probe_candidates:
+            self.live_inventory_basis_v4_maybe_start_exit_shadow_probe(
+                asset=asset,
+                candidates=exit_shadow_probe_candidates,
+                state_payload=state_payload,
+            )
         await self.maybe_log_live_inventory_v4_exit_observation(
             asset=asset,
             sample_index=index,
