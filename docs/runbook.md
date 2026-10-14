@@ -617,3 +617,24 @@ python tools/platform_pnl_report.py --start 2026-10-05 --end 2026-10-06
 
 The realized-activity report's `--no-sync` option uses the last saved RH
 snapshot. It does not affect the account-equity daily report.
+
+### RH delayed market data and execution cooldown
+
+Live inventory compares the RH order-book message's Unix-millisecond
+`timestamp` with the VPS clock as well as its local receive time. A missing,
+future, or older-than-750-ms exchange timestamp blocks ordinary entries and
+profit exits. Keep the VPS clock synchronized; a clock error over 500 ms into
+the future makes the book unusable. The risk-health file exposes the server
+timestamp, receive age, effective age, and execution cooldown remaining.
+
+For normal V4 profit exits, the RH IOC price is capped at the worst price that
+still meets the minimum estimated pair profit using the current Var exit quote.
+If the boundary cannot reach the RH top of book, neither leg is submitted.
+Actual pair profit can still differ if the Var fill moves or the RH order is
+partially filled; reconcile both venues after an uncertain submission.
+
+One RH fill with more than 6 bps adverse price drift, or three fills with
+wire-to-fill time of at least 2 seconds among the last five measured fills,
+pauses new entries and ordinary profit exits for five minutes. The pause is
+saved in the live inventory state across restarts. Emergency and operator
+position-reconciliation flows are not gated by this cooldown.

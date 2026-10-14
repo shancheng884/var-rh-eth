@@ -1223,11 +1223,11 @@ def test_account_risk_refreshes_stale_variational_snapshot_via_api() -> None:
 
         assert context["risk_action"] == "normal"
         assert context["variational_account_snapshot_fresh"] is True
-        assert context["variational_equity_usd"] == "102"
+        assert context["variational_equity_usd"] == "101"
         assert context["variational_portfolio_refresh_attempted"] is True
         assert context["variational_portfolio_refresh_ok"] is True
         assert context["variational_portfolio_refresh_reason"] == "api_fallback"
-        assert context["variational_portfolio_refresh_equity_usd"] == "102"
+        assert context["variational_portfolio_refresh_equity_usd"] == "101"
         json.dumps(context)
 
     asyncio.run(run())
@@ -9154,10 +9154,38 @@ def test_live_inventory_state_writer_freezes_mutable_snapshot(tmp_path) -> None:
     asyncio.run(run())
 
 
+def _prepare_v4_exit_pair_test(runtime) -> None:
+    runtime.lighter_submit_transport = "ws"
+    runtime.lighter_order_mode = "market-ioc"
+    runtime.base_amount_multiplier = Decimal("10000")
+    runtime.live_inventory_max_lighter_book_age_seconds = 2.0
+
+    class Limiter:
+        async def acquire(self, **_kwargs):
+            return None
+
+    async def snapshot(**_kwargs):
+        return {
+            "book_age_seconds": 0.1,
+            "book_depth_sufficient": True,
+            "estimated_fill_price": "1901",
+            "book_snapshot_best_bid": "1901",
+            "book_snapshot_best_ask": "1902",
+        }
+
+    async def plan(_record):
+        return ("SELL", Decimal("1895"), 100)
+
+    runtime.live_inventory_order_limiter = lambda _venue: Limiter()
+    runtime.live_inventory_lighter_exit_snapshot = snapshot
+    runtime.build_hedge_plan = plan
+
+
 def test_v4_exit_pair_submits_both_legs_concurrently(tmp_path) -> None:
     async def run() -> None:
         runtime = _live_inventory_runtime(tmp_path)
         runtime.live_inventory_basis_v4_mode = True
+        _prepare_v4_exit_pair_test(runtime)
         var_started = asyncio.Event()
         lighter_started = asyncio.Event()
 
@@ -9200,6 +9228,9 @@ def test_v4_exit_pair_submits_both_legs_concurrently(tmp_path) -> None:
             var_amount="0.01",
             var_exit_price=Decimal("1900"),
             exit_lighter_depth={"estimated_fill_price": "1901"},
+            entry_var_price=Decimal("1900"),
+            entry_lighter_price=Decimal("1900"),
+            minimum_executable_pnl_bps=None,
         )
 
         var_result, _, lighter_record, lighter_payload, _, var_exc, lighter_exc, context = result
@@ -9231,6 +9262,7 @@ def test_v4_exit_pair_preserves_one_leg_exception_outcome(tmp_path) -> None:
     async def run() -> None:
         runtime = _live_inventory_runtime(tmp_path)
         runtime.live_inventory_basis_v4_mode = True
+        _prepare_v4_exit_pair_test(runtime)
 
         async def fake_send_variational_place_order(**_kwargs):
             raise RuntimeError("var timeout unknown")
@@ -9253,6 +9285,9 @@ def test_v4_exit_pair_preserves_one_leg_exception_outcome(tmp_path) -> None:
             var_amount="0.01",
             var_exit_price=Decimal("1900"),
             exit_lighter_depth=None,
+            entry_var_price=Decimal("1900"),
+            entry_lighter_price=Decimal("1900"),
+            minimum_executable_pnl_bps=None,
         )
 
         assert result[0] is None
@@ -9447,6 +9482,125 @@ def test_lighter_exit_retry_plan_keeps_original_price_boundary(tmp_path) -> None
     asyncio.run(run())
 
 
+def test_live_lighter_book_uses_exchange_timestamp_not_receive_time(tmp_path) -> None:
+    runtime = _live_inventory_runtime(tmp_path)
+    runtime.live_inventory_max_lighter_book_age_seconds = 2.0
+    runtime.last_lighter_order_book_update_at = datetime.now(timezone.utc).isoformat()
+    runtime.last_lighter_order_book_server_timestamp_valid = False
+    runtime.last_lighter_order_book_server_timestamp_ms = None
+
+    runtime._record_lighter_server_book_timestamp({"timestamp": int(time.time() * 1000) - 3000})
+    assert runtime.live_inventory_lighter_book_age_ok()[0] is False
+    runtime._record_lighter_server_book_timestamp({"timestamp": int(time.time() * 1000) - 100})
+    assert runtime.live_inventory_lighter_book_age_ok()[0] is True
+    runtime._record_lighter_server_book_timestamp({"timestamp": int(time.time() * 1000) + 2000})
+    assert runtime.live_inventory_lighter_book_age_ok() == (False, None)
+    runtime._record_lighter_server_book_timestamp({})
+    assert runtime.live_inventory_lighter_book_age_ok() == (False, None)
+
+
+def test_lighter_execution_anomaly_cools_new_trades(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.live_inventory_lighter_recent_fill_slow = deque(maxlen=5)
+        for _ in range(3):
+            await runtime.observe_live_inventory_lighter_execution(
+                asset="ETH", phase="exit",
+                payload={"live_wire_sent_to_fill_ms": "2100"},
+                adverse_slippage_bps=Decimal("0"),
+            )
+        assert runtime.live_inventory_lighter_execution_pause_until_monotonic > time.monotonic()
+        runtime.live_inventory_lighter_execution_pause_until_monotonic = 0
+        runtime.live_inventory_lighter_recent_fill_slow.clear()
+        await runtime.observe_live_inventory_lighter_execution(
+            asset="ETH", phase="entry", payload={},
+            adverse_slippage_bps=Decimal("8"),
+        )
+        assert runtime.live_inventory_lighter_execution_pause_until_monotonic > time.monotonic()
+        state = json.loads(runtime.live_inventory_state_file.read_text())
+        assert datetime.fromisoformat(state["lighter_execution_pause_until_utc"]) > datetime.now(timezone.utc)
+
+    asyncio.run(run())
+
+
+def test_v4_profit_exit_caps_rh_ioc_price_before_either_leg_submits(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.base_amount_multiplier = Decimal("10000")
+        runtime.price_multiplier = Decimal("100")
+        runtime.lighter_submit_transport = "ws"
+        runtime.lighter_order_mode = "market-ioc"
+        runtime.live_inventory_max_lighter_book_age_seconds = 2.0
+        submissions = []
+        book_ask = Decimal("100")
+        book_bid = Decimal("99.70")
+        plan_side = "BUY"
+        plan_price = Decimal("100.30")
+
+        class Limiter:
+            async def acquire(self, **_kwargs):
+                return None
+
+        runtime.live_inventory_order_limiter = lambda _venue: Limiter()
+
+        async def snapshot(**_kwargs):
+            return {
+                "book_age_seconds": 0.1, "book_depth_sufficient": True,
+                "estimated_fill_price": str(book_ask if _kwargs["lighter_side"] == "BUY" else book_bid),
+                "book_snapshot_best_bid": str(book_bid),
+                "book_snapshot_best_ask": str(book_ask),
+            }
+
+        async def plan(_record):
+            return (plan_side, plan_price, 10000)
+
+        async def var_submit(**_kwargs):
+            submissions.append("var")
+            return {"ok": True}
+
+        async def rh_submit(**kwargs):
+            submissions.append(kwargs["prepared_plan"])
+            return None, {"trade_key": "rh-exit"}
+
+        runtime.live_inventory_lighter_exit_snapshot = snapshot
+        runtime.build_hedge_plan = plan
+        runtime.send_variational_place_order = var_submit
+        runtime.place_lighter_order_from_plan = rh_submit
+
+        params = dict(
+            asset="ETH", lot={"lot_id": 1},
+            direction="long_var_short_lighter", exit_side="SELL",
+            qty=Decimal("1"), var_amount="1", var_exit_price=Decimal("100"),
+            exit_lighter_depth=None, entry_var_price=Decimal("100"),
+            entry_lighter_price=Decimal("100"),
+            minimum_executable_pnl_bps=Decimal("4"),
+        )
+        blocked = await runtime.submit_live_inventory_exit_pair(**params)
+        assert blocked[-1]["preflight_reason"] == "executable_exit_pnl_below_threshold"
+        assert submissions == []
+
+        book_ask = Decimal("99.80")
+        await runtime.submit_live_inventory_exit_pair(**params)
+        assert submissions[0] == "var"
+        assert submissions[1][1] == Decimal("99.96")
+
+        plan_side, plan_price = "SELL", Decimal("99.70")
+        book_bid, book_ask = Decimal("100.20"), Decimal("100.30")
+        params["direction"] = "short_var_long_lighter"
+        params["exit_side"] = "BUY"
+        await runtime.submit_live_inventory_exit_pair(**params)
+        assert submissions[-1][1] == Decimal("100.04")
+
+        runtime.live_inventory_lighter_execution_pause_until_monotonic = time.monotonic() + 60
+        blocked = await runtime.submit_live_inventory_exit_pair(**params)
+        assert blocked[-1]["preflight_reason"] == "lighter_execution_cooldown"
+        params["minimum_executable_pnl_bps"] = None
+        await runtime.submit_live_inventory_exit_pair(**params)
+        assert submissions[-1][1] == Decimal("99.70")
+
+    asyncio.run(run())
+
+
 def test_v4_exit_pair_timeout_returns_execution_unknown_without_hanging(
     tmp_path,
     monkeypatch,
@@ -9454,6 +9608,7 @@ def test_v4_exit_pair_timeout_returns_execution_unknown_without_hanging(
     async def run() -> None:
         runtime = _live_inventory_runtime(tmp_path)
         runtime.live_inventory_basis_v4_mode = True
+        _prepare_v4_exit_pair_test(runtime)
 
         async def slow_submit(**_kwargs):
             await asyncio.sleep(1)
@@ -9471,6 +9626,9 @@ def test_v4_exit_pair_timeout_returns_execution_unknown_without_hanging(
             var_amount="0.01",
             var_exit_price=Decimal("1900"),
             exit_lighter_depth=None,
+            entry_var_price=Decimal("1900"),
+            entry_lighter_price=Decimal("1900"),
+            minimum_executable_pnl_bps=None,
         )
 
         assert isinstance(result[5], TimeoutError)

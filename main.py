@@ -339,6 +339,12 @@ LIVE_INVENTORY_LIGHTER_RECOVERY_MAX_SECONDS = 1200.0
 LIVE_INVENTORY_LIGHTER_RECOVERY_MAX_BASIS_DEVIATION_BPS = Decimal("20")
 LIVE_INVENTORY_LIGHTER_RECOVERY_CONFIRM_SAMPLES = 3
 LIVE_INVENTORY_LIGHTER_RECOVERY_CONFIRM_SECONDS = 30.0
+LIVE_INVENTORY_LIGHTER_SERVER_BOOK_MAX_AGE_SECONDS = 0.75
+LIVE_INVENTORY_LIGHTER_SERVER_CLOCK_FUTURE_TOLERANCE_SECONDS = 0.5
+LIVE_INVENTORY_LIGHTER_SLOW_FILL_SECONDS = 2.0
+LIVE_INVENTORY_LIGHTER_SLOW_FILL_COUNT = 3
+LIVE_INVENTORY_LIGHTER_ABNORMAL_SLIPPAGE_BPS = Decimal("6")
+LIVE_INVENTORY_LIGHTER_EXECUTION_COOLDOWN_SECONDS = 300.0
 # An automatic rollback is safe to rearm only after both venue APIs confirm
 # the post-rollback position. The bounded retry covers exchange settlement
 # lag without turning a transient mismatch into a permanent manual stop.
@@ -2993,6 +2999,11 @@ class VariationalToLighterRuntime:
 
         self.last_variational_trade_event_at: str | None = None
         self.last_lighter_order_book_update_at: str | None = None
+        self.last_lighter_order_book_server_timestamp_ms: int | None = None
+        self.last_lighter_order_book_server_timestamp_valid = False
+        self.live_inventory_lighter_recent_fill_slow: deque[bool] = deque(maxlen=5)
+        self.live_inventory_lighter_execution_pause_until_monotonic = 0.0
+        self.live_inventory_lighter_execution_pause_until_utc: str | None = None
         self.live_inventory_lighter_recovery_guard: dict[str, Any] = {
             "state": "normal"
         }
@@ -4686,6 +4697,15 @@ class VariationalToLighterRuntime:
             if isinstance(recovery_guard, dict)
             else {"state": "normal"}
         )
+        pause_until = self._parse_iso_ts(state.get("lighter_execution_pause_until_utc"))
+        remaining = max(
+            0.0,
+            (pause_until - datetime.now(timezone.utc)).total_seconds(),
+        ) if pause_until is not None else 0.0
+        self.live_inventory_lighter_execution_pause_until_monotonic = time.monotonic() + remaining
+        self.live_inventory_lighter_execution_pause_until_utc = (
+            pause_until.isoformat() if remaining > 0 else None
+        )
         self.live_inventory_loss_review_required = bool(
             state.get("loss_review_required", False)
         )
@@ -6369,6 +6389,18 @@ class VariationalToLighterRuntime:
                     "reference_basis_bps"
                 )
             ),
+            "lighter_book_server_timestamp_ms": getattr(
+                self, "last_lighter_order_book_server_timestamp_ms", None
+            ),
+            "lighter_book_received_age_seconds": self._age_seconds_from_iso(
+                getattr(self, "last_lighter_order_book_update_at", None)
+            ),
+            "lighter_book_effective_age_seconds": self._lighter_order_book_age_seconds(),
+            "lighter_execution_cooldown_remaining_seconds": max(
+                0.0,
+                getattr(self, "live_inventory_lighter_execution_pause_until_monotonic", 0.0)
+                - time.monotonic(),
+            ),
             **context,
             **reference_feed,
         }
@@ -7955,6 +7987,9 @@ class VariationalToLighterRuntime:
                     self,
                     "live_inventory_lighter_recovery_guard",
                     {"state": "normal"},
+                ),
+                "lighter_execution_pause_until_utc": getattr(
+                    self, "live_inventory_lighter_execution_pause_until_utc", None
                 ),
                 "loss_review_required": bool(
                     getattr(self, "live_inventory_loss_review_required", False)
@@ -12534,6 +12569,12 @@ class VariationalToLighterRuntime:
                 entry_lighter_slippage_bps = ((lighter_fill_price - estimated_entry_lighter_price) / estimated_entry_lighter_price) * Decimal("10000")
             if entry_lighter_slippage_bps is not None and entry_lighter_slippage_bps < 0:
                 entry_lighter_slippage_bps = Decimal("0")
+        await self.observe_live_inventory_lighter_execution(
+            asset=asset,
+            phase="entry",
+            payload=lighter_record.to_payload(),
+            adverse_slippage_bps=entry_lighter_slippage_bps,
+        )
         if entry_lighter_slippage_bps is not None and entry_lighter_slippage_bps > self.live_inventory_max_lighter_slippage_bps:
             auto_close_context = await self.try_auto_close_unhedged_live_inventory_leg(
                 asset=asset,
@@ -12775,6 +12816,51 @@ class VariationalToLighterRuntime:
             },
         )
 
+    async def observe_live_inventory_lighter_execution(
+        self,
+        *,
+        asset: str,
+        phase: str,
+        payload: dict[str, Any],
+        adverse_slippage_bps: Decimal | None,
+    ) -> None:
+        wire_to_fill_ms = to_decimal(payload.get("live_wire_sent_to_fill_ms"))
+        if wire_to_fill_ms is not None and wire_to_fill_ms >= 0:
+            recent = getattr(self, "live_inventory_lighter_recent_fill_slow", None)
+            if recent is None:
+                recent = deque(maxlen=5)
+                self.live_inventory_lighter_recent_fill_slow = recent
+            recent.append(
+                wire_to_fill_ms >= Decimal(str(LIVE_INVENTORY_LIGHTER_SLOW_FILL_SECONDS * 1000))
+            )
+        slow = sum(getattr(self, "live_inventory_lighter_recent_fill_slow", ())) >= LIVE_INVENTORY_LIGHTER_SLOW_FILL_COUNT
+        high_slippage = (
+            adverse_slippage_bps is not None
+            and adverse_slippage_bps > LIVE_INVENTORY_LIGHTER_ABNORMAL_SLIPPAGE_BPS
+        )
+        if not slow and not high_slippage:
+            return
+        self.live_inventory_lighter_execution_pause_until_monotonic = max(
+            getattr(self, "live_inventory_lighter_execution_pause_until_monotonic", 0.0),
+            time.monotonic() + LIVE_INVENTORY_LIGHTER_EXECUTION_COOLDOWN_SECONDS,
+        )
+        self.live_inventory_lighter_execution_pause_until_utc = (
+            datetime.now(timezone.utc)
+            + timedelta(seconds=LIVE_INVENTORY_LIGHTER_EXECUTION_COOLDOWN_SECONDS)
+        ).isoformat()
+        await self.persist_live_inventory_memory(reason="lighter_execution_cooldown")
+        await self.append_live_inventory_log(
+            "live_inventory_lighter_execution_cooldown",
+            {
+                "asset": asset,
+                "phase": phase,
+                "reason": "abnormal_slippage" if high_slippage else "repeated_slow_fills",
+                "wire_to_fill_ms": decimal_to_str(wire_to_fill_ms),
+                "adverse_slippage_bps": decimal_to_str(adverse_slippage_bps),
+                "cooldown_seconds": LIVE_INVENTORY_LIGHTER_EXECUTION_COOLDOWN_SECONDS,
+            },
+        )
+
     async def maybe_append_live_inventory_actual_pnl(self, payload: dict[str, Any]) -> None:
         trade_key = str(payload.get("trade_key") or "")
         pending = self.pending_live_inventory_actual_pnl.pop(trade_key, None)
@@ -12881,6 +12967,12 @@ class VariationalToLighterRuntime:
         latency_ms = to_decimal(var_fill_to_lighter_fill_ms)
         if latency_ms is not None and latency_ms >= 0:
             self.live_inventory_exit_fill_latency_ms_samples.append(latency_ms)
+        await self.observe_live_inventory_lighter_execution(
+            asset=str(pending.get("asset") or ""),
+            phase="exit",
+            payload=payload,
+            adverse_slippage_bps=exit_lighter_slippage_bps,
+        )
         self.live_inventory_realized_pnl_usd += actual_pnl - estimated_pnl
         if (
             getattr(self, "live_inventory_execution_calibration", False)
@@ -16178,6 +16270,10 @@ class VariationalToLighterRuntime:
                 preflight_reason = "real_lighter_exit_requires_live_mode"
             elif getattr(self, "live_inventory_dry_decisions", False):
                 preflight_reason = "live_inventory_dry_decisions_block_real_exit"
+            elif minimum_executable_pnl_bps is not None and time.monotonic() < getattr(
+                self, "live_inventory_lighter_execution_pause_until_monotonic", 0.0
+            ):
+                preflight_reason = "lighter_execution_cooldown"
             elif recovery_state in {"outage", "recovery"}:
                 preflight_reason = "lighter_market_recovery_confirmation_pending"
                 book = {"lighter_recovery_guard_state": recovery_state}
@@ -16193,6 +16289,11 @@ class VariationalToLighterRuntime:
                 max_book_age = float(
                     getattr(self, "live_inventory_max_lighter_book_age_seconds", 0.0)
                 )
+                if minimum_executable_pnl_bps is not None:
+                    max_book_age = min(
+                        max_book_age,
+                        LIVE_INVENTORY_LIGHTER_SERVER_BOOK_MAX_AGE_SECONDS,
+                    )
                 book_age = depth.get("book_age_seconds")
                 if (
                     not depth.get("book_depth_sufficient")
@@ -16265,6 +16366,33 @@ class VariationalToLighterRuntime:
                     planned_qty = Decimal(plan[2]) / self.base_amount_multiplier
                     if planned_qty != qty:
                         preflight_reason = "lighter_exit_qty_rounding_mismatch"
+                    elif minimum_executable_pnl_bps is not None:
+                        target_usd = qty * entry_var_price * minimum_executable_pnl_bps / Decimal("10000")
+                        if direction == DIRECTION_LONG_VAR_SHORT_LIGHTER:
+                            worst_price = entry_lighter_price + var_exit_price - entry_var_price - target_usd / qty
+                            bounded_price = min(plan[1], worst_price)
+                            bounded_price = (
+                                (bounded_price * self.price_multiplier).to_integral_value(rounding=ROUND_DOWN)
+                                / self.price_multiplier
+                            )
+                            top_price = to_decimal(book.get("book_snapshot_best_ask"))
+                            if top_price is None or bounded_price < top_price:
+                                preflight_reason = "lighter_exit_profit_price_boundary_unmarketable"
+                        elif direction == DIRECTION_SHORT_VAR_LONG_LIGHTER:
+                            worst_price = entry_lighter_price + target_usd / qty - entry_var_price + var_exit_price
+                            bounded_price = max(plan[1], worst_price)
+                            bounded_price = (
+                                (bounded_price * self.price_multiplier).to_integral_value(rounding=ROUND_UP)
+                                / self.price_multiplier
+                            )
+                            top_price = to_decimal(book.get("book_snapshot_best_bid"))
+                            if top_price is None or bounded_price > top_price:
+                                preflight_reason = "lighter_exit_profit_price_boundary_unmarketable"
+                        else:
+                            preflight_reason = "lighter_exit_direction_unknown"
+                        if preflight_reason is None:
+                            plan = (plan[0], bounded_price, plan[2])
+                            ledger_context["profit_price_boundary"] = decimal_to_str(bounded_price)
         except Exception as exc:
             preflight_reason = f"exit_preflight_error:{type(exc).__name__}:{exc}"
             book = {"book_age_seconds": self._lighter_order_book_age_seconds()}
@@ -16709,6 +16837,7 @@ class VariationalToLighterRuntime:
                                 self.lighter_snapshot_loaded = True
                                 self.lighter_order_book_ready = True
                                 self.last_lighter_order_book_update_at = utc_now()
+                                self._record_lighter_server_book_timestamp(data)
                                 self.lighter_best_bid = (
                                     max(self.lighter_order_book["bids"].keys())
                                     if self.lighter_order_book["bids"]
@@ -16733,6 +16862,7 @@ class VariationalToLighterRuntime:
                                     self.update_lighter_order_book("asks", order_book.get("asks", []))
                                     self.lighter_order_book_offset = new_offset
                                     self.last_lighter_order_book_update_at = utc_now()
+                                    self._record_lighter_server_book_timestamp(data)
                                     self.lighter_best_bid = (
                                         max(self.lighter_order_book["bids"].keys())
                                         if self.lighter_order_book["bids"]
@@ -16877,7 +17007,7 @@ class VariationalToLighterRuntime:
             asks = dict(self.lighter_order_book.get("asks", {}))
             update_at = self.last_lighter_order_book_update_at
 
-        age_seconds = self._age_seconds_from_iso(update_at)
+        age_seconds = self._lighter_order_book_age_seconds()
         best_bid = max(bids) if bids else None
         best_ask = min(asks) if asks else None
         normalized_side = lighter_side.strip().upper()
@@ -16942,12 +17072,43 @@ class VariationalToLighterRuntime:
             ),
         }
 
+    def _record_lighter_server_book_timestamp(self, message: dict[str, Any]) -> None:
+        raw = message.get("timestamp")
+        try:
+            timestamp_ms = int(raw)
+        except (TypeError, ValueError, OverflowError):
+            timestamp_ms = None
+        # Lighter order-book messages use Unix milliseconds. Missing or
+        # implausible timestamps must not make a delayed book look fresh.
+        self.last_lighter_order_book_server_timestamp_ms = timestamp_ms
+        self.last_lighter_order_book_server_timestamp_valid = bool(
+            timestamp_ms is not None
+            and 1_500_000_000_000 <= timestamp_ms <= 4_000_000_000_000
+        )
+
     def _lighter_order_book_age_seconds(self) -> float | None:
-        return self._age_seconds_from_iso(self.last_lighter_order_book_update_at)
+        receive_age = self._age_seconds_from_iso(self.last_lighter_order_book_update_at)
+        if not getattr(self, "live_inventory", False) or not hasattr(
+            self, "last_lighter_order_book_server_timestamp_valid"
+        ):
+            return receive_age
+        if not self.last_lighter_order_book_server_timestamp_valid:
+            return None
+        server_age = time.time() - self.last_lighter_order_book_server_timestamp_ms / 1000
+        if server_age < -LIVE_INVENTORY_LIGHTER_SERVER_CLOCK_FUTURE_TOLERANCE_SECONDS:
+            return None
+        if receive_age is None or receive_age < 0:
+            return None
+        return max(receive_age, server_age)
 
     def live_inventory_lighter_book_age_ok(self) -> tuple[bool, float | None]:
         age = self._lighter_order_book_age_seconds()
-        limit = self.live_inventory_max_lighter_book_age_seconds
+        limit = min(
+            self.live_inventory_max_lighter_book_age_seconds,
+            LIVE_INVENTORY_LIGHTER_SERVER_BOOK_MAX_AGE_SECONDS,
+        ) if getattr(self, "live_inventory", False) else self.live_inventory_max_lighter_book_age_seconds
+        if age is None:
+            return False, None
         if limit <= 0:
             return True, age
         return age is not None and age <= limit, age
@@ -20923,6 +21084,9 @@ class VariationalToLighterRuntime:
                 False,
             )
             and not self.lighter_recovery_entries_blocked()
+            and time.monotonic() >= getattr(
+                self, "live_inventory_lighter_execution_pause_until_monotonic", 0.0
+            )
             and not getattr(self, "live_inventory_loss_review_required", False)
             and (
                 not self.live_inventory_open_lots
