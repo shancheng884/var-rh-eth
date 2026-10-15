@@ -215,6 +215,7 @@ def validate_state(
     collect_only: bool = False,
     close_open_position: bool = False,
     resume_open_position: bool = False,
+    reconcile_manual_exit: bool = False,
 ) -> tuple[bool, str]:
     state = read_json(LIVE_STATE)
     if not state:
@@ -266,6 +267,77 @@ def validate_state(
 
     if resume_open_position:
         manual_reason = str(state.get("manual_review_reason") or "")
+        completed_exit_summary = None
+        if reconcile_manual_exit:
+            if (
+                status != "manual_review_required"
+                or manual_reason != "startup_reconcile_exchange_position_mismatch"
+            ):
+                return False, "manual_exit_reconcile_requires_exchange_position_mismatch_state"
+            if len(pending_actions) != 1 or not isinstance(pending_actions[0], dict):
+                return False, "manual_exit_reconcile_requires_exactly_one_pending_action"
+            pending = pending_actions[0]
+            pending_context = pending.get("context")
+            pending_context = pending_context if isinstance(pending_context, dict) else {}
+            if (
+                pending.get("role") != "live_inventory_exit"
+                or str(pending.get("asset") or asset).upper() != asset
+                or pending.get("execution_unknown")
+                or pending.get("reconciliation_required")
+                or pending_context.get("execution_unknown")
+                or pending_context.get("reconciliation_required")
+            ):
+                return False, "manual_exit_reconcile_pending_action_is_not_a_known_exit"
+            try:
+                lot_id = int(pending.get("lot_id"))
+            except (TypeError, ValueError):
+                return False, "manual_exit_reconcile_pending_lot_id_invalid"
+            lots_for_exit = [
+                lot
+                for lot in open_lots
+                if isinstance(lot, dict)
+                and str(lot.get("lot_id")) == str(lot_id)
+            ]
+            try:
+                pending_qty = Decimal(str(pending.get("qty")))
+                lot_qty = (
+                    Decimal(str(lots_for_exit[0].get("qty")))
+                    if len(lots_for_exit) == 1
+                    else None
+                )
+            except Exception:
+                return False, "manual_exit_reconcile_pending_qty_invalid"
+            if (
+                len(lots_for_exit) != 1
+                or pending_qty <= 0
+                or lot_qty is None
+                or pending_qty != lot_qty
+            ):
+                return False, "manual_exit_reconcile_pending_qty_does_not_match_lot"
+            remaining = [lot for lot in open_lots if lot is not lots_for_exit[0]]
+            if not remaining:
+                return False, "manual_exit_reconcile_refuses_flat_state"
+            directions = {str(lot.get("direction") or "") for lot in remaining}
+            try:
+                remaining_qty = sum(
+                    (Decimal(str(lot.get("qty"))) for lot in remaining),
+                    Decimal("0"),
+                )
+            except Exception:
+                return False, "manual_exit_reconcile_remaining_qty_invalid"
+            if (
+                len(directions) != 1
+                or remaining_qty <= 0
+                or next(iter(directions))
+                not in {"long_var_short_lighter", "short_var_long_lighter"}
+                or str(lots_for_exit[0].get("direction") or "")
+                != next(iter(directions))
+            ):
+                return False, "manual_exit_reconcile_remaining_lots_invalid"
+            completed_exit_summary = (
+                f" manual_exit_lot={lot_id} removed_qty={pending_qty} "
+                f"expected_remaining_qty={remaining_qty}"
+            )
         state_is_resumable = status in {"open", "pending"} or (
             status == "manual_review_required"
             and manual_reason in RECOVERABLE_OPEN_STATE_MANUAL_REASONS
@@ -273,7 +345,7 @@ def validate_state(
                 manual_reason != "basis_entry_lighter_submit_after_var_fill_failed"
                 or not pending_actions
             )
-        )
+        ) or completed_exit_summary is not None
         if not state_is_resumable:
             return (
                 False,
@@ -285,7 +357,7 @@ def validate_state(
             True,
             f"state={status} asset={asset} open_lots={len(open_lots)} "
             f"pending_actions={len(pending_actions)} completed_cycles={completed_cycles} "
-            "resume_requested strict_exchange_reconcile_required=true",
+            f"resume_requested strict_exchange_reconcile_required=true{completed_exit_summary or ''}",
         )
 
     if reset_state_after_manual_flat and not collect_only:
@@ -529,6 +601,7 @@ def build_main_command(
     v4_continuous: bool = False,
     close_open_position: bool = False,
     resume_open_position: bool = False,
+    reconcile_manual_exit: bool = False,
     maintenance_drain_after_start: bool = False,
     reset_state_only_after_manual_flat: bool = False,
     flat_reset_confirmation: str | None = None,
@@ -669,6 +742,8 @@ def build_main_command(
         if resume_open_position
         else "--live-inventory-i-confirm-flat-start"
     )
+    if reconcile_manual_exit:
+        command.append("--live-inventory-i-reconcile-completed-exit")
     if maintenance_drain_after_start:
         command.append("--live-inventory-maintenance-drain-after-start")
     if collect_only:
@@ -898,6 +973,14 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--reconcile-manual-exit",
+        action="store_true",
+        help=(
+            "With --resume-open-position, remove one pending exit lot only after live "
+            "positions match the remaining lots and both exchanges report no active orders."
+        ),
+    )
+    parser.add_argument(
         "--drain-after-flat",
         action="store_true",
         help=(
@@ -1049,6 +1132,8 @@ def main() -> int:
         )
     if args.resume_open_position and not args.v4_live:
         parser.error("--resume-open-position requires --v4-live")
+    if args.reconcile_manual_exit and not args.resume_open_position:
+        parser.error("--reconcile-manual-exit requires --resume-open-position")
     if args.resume_open_position and (
         args.close_open_position
         or args.reset_state_after_manual_flat
@@ -1166,6 +1251,7 @@ def main() -> int:
         collect_only=args.collect_only,
         close_open_position=args.close_open_position,
         resume_open_position=args.resume_open_position,
+        reconcile_manual_exit=args.reconcile_manual_exit,
     )
     print(state_message)
     print(disk_warning())
@@ -1203,6 +1289,7 @@ def main() -> int:
             v4_continuous=args.v4_continuous,
             close_open_position=args.close_open_position,
             resume_open_position=args.resume_open_position,
+            reconcile_manual_exit=args.reconcile_manual_exit,
             maintenance_drain_after_start=(
                 args.drain_after_flat and args.resume_open_position
             ),
@@ -1269,6 +1356,14 @@ def main() -> int:
                 return 2
             command[command.index("--live-inventory-flat-reset-confirmation") + 1] = confirmation
         print("Only exchange verification and local-state reset will run; no trading loop will start.")
+    elif args.reconcile_manual_exit:
+        expected_confirmation = f"RECONCILE_EXIT_{asset}"
+        confirmation = input(
+            f"确认待处理平仓子单已人工核销；程序将在线核对实仓和活动订单，输入 {expected_confirmation}: "
+        ).strip().upper()
+        if confirmation != expected_confirmation:
+            print("REFUSE_START reason=manual_exit_reconcile_confirmation_mismatch")
+            return 2
     else:
         print("Starting live. You are responsible for confirming both exchanges are flat before running this command.")
     return subprocess.call(command, cwd=ROOT)

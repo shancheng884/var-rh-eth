@@ -2261,6 +2261,9 @@ class VariationalToLighterRuntime:
         self.live_inventory_i_accept_basis_real_diagnostic = bool(args.live_inventory_i_accept_basis_real_diagnostic)
         self.live_inventory_i_confirm_flat_start = bool(args.live_inventory_i_confirm_flat_start)
         self.live_inventory_i_accept_open_state_resume = bool(args.live_inventory_i_accept_open_state_resume)
+        self.live_inventory_i_reconcile_completed_exit = bool(
+            args.live_inventory_i_reconcile_completed_exit
+        )
         self.live_inventory_maintenance_drain_after_start = bool(
             args.live_inventory_maintenance_drain_after_start
         )
@@ -7801,6 +7804,18 @@ class VariationalToLighterRuntime:
             )
             raise RuntimeError("Live inventory startup reconcile failed: could not verify both exchange positions")
 
+        manual_exit_reconciliation: dict[str, Any] | None = None
+        if self.live_inventory_i_reconcile_completed_exit:
+            manual_exit_reconciliation = await self.reconcile_manually_completed_exit_lot(
+                asset=asset,
+                saved_state=saved_state,
+                persisted_pending_actions=persisted_pending_actions,
+                variational_position_qty=variational_position_qty,
+                lighter_position_qty=lighter_position_qty,
+            )
+            if manual_exit_reconciliation is not None:
+                persisted_pending_actions = []
+
         if balanced_entry_recovery:
             if persisted_pending_actions:
                 raise RuntimeError(
@@ -7948,6 +7963,146 @@ class VariationalToLighterRuntime:
         await self.persist_live_inventory_memory(
             reason="startup_open_state_reconciled"
         )
+        if manual_exit_reconciliation is not None:
+            await self.append_live_inventory_log(
+                "live_inventory_manual_exit_reconciled",
+                manual_exit_reconciliation,
+            )
+
+    async def reconcile_manually_completed_exit_lot(
+        self,
+        *,
+        asset: str,
+        saved_state: dict[str, Any],
+        persisted_pending_actions: list[dict[str, Any]],
+        variational_position_qty: Decimal,
+        lighter_position_qty: Decimal,
+    ) -> dict[str, Any] | None:
+        """Drop one manually completed exit only after live positions and orders prove it."""
+        if (
+            saved_state.get("status") != "manual_review_required"
+            or saved_state.get("manual_review_reason")
+            != "startup_reconcile_exchange_position_mismatch"
+        ):
+            raise RuntimeError(
+                "manual exit reconcile requires startup_reconcile_exchange_position_mismatch"
+            )
+        if len(persisted_pending_actions) != 1:
+            raise RuntimeError("manual exit reconcile requires exactly one pending action")
+        pending = persisted_pending_actions[0]
+        pending_context = pending.get("context")
+        pending_context = pending_context if isinstance(pending_context, dict) else {}
+        if (
+            pending.get("role") != "live_inventory_exit"
+            or str(pending.get("asset") or asset).upper() != asset.upper()
+            or pending.get("execution_unknown")
+            or pending.get("reconciliation_required")
+            or pending_context.get("execution_unknown")
+            or pending_context.get("reconciliation_required")
+        ):
+            raise RuntimeError("pending action is not a confirmed, known-outcome exit")
+        try:
+            lot_id = int(pending.get("lot_id"))
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("pending exit has no valid lot id") from exc
+        pending_qty = to_decimal(pending.get("qty"))
+        if pending_qty is None or pending_qty <= 0:
+            raise RuntimeError("pending exit quantity is invalid")
+        matching_lots = [
+            lot
+            for lot in self.live_inventory_open_lots
+            if int(lot.get("lot_id") or 0) == lot_id
+        ]
+        if len(matching_lots) != 1:
+            raise RuntimeError("pending exit does not identify exactly one open lot")
+        closed_lot = matching_lots[0]
+        closed_qty = to_decimal(closed_lot.get("qty"))
+        if closed_qty is None or closed_qty <= 0 or closed_qty != pending_qty:
+            raise RuntimeError("pending exit quantity does not equal its open lot")
+
+        remaining_lots = [
+            lot for lot in self.live_inventory_open_lots if lot is not closed_lot
+        ]
+        if not remaining_lots:
+            raise RuntimeError("manual exit reconcile refuses to infer a flat state")
+        directions = {str(lot.get("direction") or "") for lot in remaining_lots}
+        if len(directions) != 1:
+            raise RuntimeError("remaining lots do not share one hedge direction")
+        direction = next(iter(directions))
+        if str(closed_lot.get("direction") or "") != direction:
+            raise RuntimeError("pending exit lot direction differs from the remaining hedge")
+        pending_direction = str(pending.get("direction") or direction)
+        if pending_direction != direction:
+            raise RuntimeError("pending exit direction differs from its lot")
+        if direction == DIRECTION_LONG_VAR_SHORT_LIGHTER:
+            var_sign, lighter_sign = Decimal("1"), Decimal("-1")
+        elif direction == DIRECTION_SHORT_VAR_LONG_LIGHTER:
+            var_sign, lighter_sign = Decimal("-1"), Decimal("1")
+        else:
+            raise RuntimeError("remaining lots have an unsupported hedge direction")
+
+        remaining_qty = Decimal("0")
+        for lot in remaining_lots:
+            qty = to_decimal(lot.get("qty"))
+            if qty is None or qty <= 0:
+                raise RuntimeError("remaining lot has an invalid quantity")
+            remaining_qty += qty
+        tolerance = self.live_inventory_position_qty_tolerance(remaining_qty)
+        expected_var = var_sign * remaining_qty
+        expected_lighter = lighter_sign * remaining_qty
+        if (
+            abs(variational_position_qty - expected_var) > tolerance
+            or abs(lighter_position_qty - expected_lighter) > tolerance
+        ):
+            raise RuntimeError(
+                "exchange positions do not exactly match the lots after removing the pending exit"
+            )
+
+        try:
+            variational_orders = await self.fetch_all_variational_pending_orders(asset=asset)
+            lighter_orders = await self.fetch_lighter_active_orders()
+        except Exception as exc:
+            raise RuntimeError(
+                "manual exit reconcile could not verify active orders on both exchanges"
+            ) from exc
+        if variational_orders or lighter_orders:
+            raise RuntimeError(
+                "manual exit reconcile refuses while active exchange orders remain"
+            )
+
+        state_file = self.live_inventory_state_file
+        if state_file is None or not state_file.exists():
+            raise RuntimeError("manual exit reconcile cannot back up the live state")
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        backup_path = state_file.with_name(
+            f"{state_file.name}.before_manual_exit_reconcile.{timestamp}.bak"
+        )
+        if backup_path.exists():
+            backup_path = state_file.with_name(
+                f"{state_file.name}.before_manual_exit_reconcile."
+                f"{timestamp}.{uuid.uuid4().hex[:8]}.bak"
+            )
+        await asyncio.to_thread(shutil.copy2, state_file, backup_path)
+
+        self.live_inventory_open_lots = remaining_lots
+        self.pending_live_inventory_var_fill_matches = []
+        self.live_inventory_startup_persisted_pending_actions = []
+        self.mark_live_inventory_state_dirty(reason="manual_exit_lot_reconciled")
+        return {
+            "asset": asset,
+            "removed_lot_id": lot_id,
+            "removed_qty": decimal_to_str(closed_qty),
+            "remaining_lots": len(remaining_lots),
+            "remaining_qty": decimal_to_str(remaining_qty),
+            "variational_position_qty": decimal_to_str(variational_position_qty),
+            "lighter_position_qty": decimal_to_str(lighter_position_qty),
+            "variational_active_orders": 0,
+            "lighter_active_orders": 0,
+            "backup": str(backup_path),
+            "fill_prices_known": False,
+            "pnl_added_to_strategy_ledger": False,
+            "action": "resume_only_after_standard_startup_reconcile_matches_remaining_lots",
+        }
 
     async def persist_live_inventory_memory(self, *, reason: str) -> None:
         pending_actions = self.pending_live_inventory_actions_payload()
@@ -14507,10 +14662,55 @@ class VariationalToLighterRuntime:
                         and bool(pending_actions)
                         and not open_lots
                     )
+                    recoverable_completed_exit = False
+                    if (
+                        self.live_inventory_i_reconcile_completed_exit
+                        and state_status == "manual_review_required"
+                        and manual_reason == "startup_reconcile_exchange_position_mismatch"
+                        and len(open_lots) >= 2
+                        and len(pending_actions) == 1
+                    ):
+                        action = pending_actions[0]
+                        try:
+                            pending_lot_id = int(action.get("lot_id"))
+                        except (AttributeError, TypeError, ValueError):
+                            pending_lot_id = -1
+                        lot_matches = []
+                        for lot in open_lots:
+                            if not isinstance(lot, dict):
+                                continue
+                            try:
+                                lot_id = int(lot.get("lot_id") or 0)
+                            except (TypeError, ValueError):
+                                continue
+                            if lot_id == pending_lot_id:
+                                lot_matches.append(lot)
+                        action_qty = to_decimal(action.get("qty")) if isinstance(action, dict) else None
+                        lot_qty = (
+                            to_decimal(lot_matches[0].get("qty"))
+                            if len(lot_matches) == 1
+                            else None
+                        )
+                        recoverable_completed_exit = bool(
+                            isinstance(action, dict)
+                            and action.get("role") == "live_inventory_exit"
+                            and not action.get("execution_unknown")
+                            and not action.get("reconciliation_required")
+                            and not (
+                                isinstance(action.get("context"), dict)
+                                and (
+                                    action["context"].get("execution_unknown")
+                                    or action["context"].get("reconciliation_required")
+                                )
+                            )
+                            and action_qty is not None
+                            and action_qty == lot_qty
+                        )
                     if (
                         (state_status == "open" and open_lots)
                         or recoverable_open_manual_review
                         or recoverable_pending_intent
+                        or recoverable_completed_exit
                     ):
                         passed.append("live_inventory_open_state_resume_accepted")
                     else:
@@ -28849,6 +29049,14 @@ def parse_args() -> argparse.Namespace:
         help="Resume managing an existing live_inventory_state.json open position after manually confirming both venues match the state.",
     )
     parser.add_argument(
+        "--live-inventory-i-reconcile-completed-exit",
+        action="store_true",
+        help=(
+            "With open-state resume, reconcile exactly one manually completed pending exit "
+            "after both live positions and active-order lists match the remaining lots."
+        ),
+    )
+    parser.add_argument(
         "--live-inventory-maintenance-drain-after-start",
         action="store_true",
         help=(
@@ -29387,6 +29595,14 @@ def parse_args() -> argparse.Namespace:
                 "--live-inventory-i-accept-open-state-resume after manually confirming the saved open state matches both venues, "
                 "--live-inventory-auto-close-manual-review-position for one-shot recovery, "
                 "or --live-inventory-force-close-open-state for a reconciled one-shot operator exit"
+            )
+        if (
+            args.live_inventory_i_reconcile_completed_exit
+            and not args.live_inventory_i_accept_open_state_resume
+        ):
+            parser.error(
+                "--live-inventory-i-reconcile-completed-exit requires "
+                "--live-inventory-i-accept-open-state-resume"
             )
         live_inventory_start_modes = sum(
             bool(flag)

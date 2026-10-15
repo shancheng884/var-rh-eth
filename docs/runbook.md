@@ -492,6 +492,23 @@ the process still refuses to trade unless both live quantities and directions
 match every saved lot. It never clears the manual-review state merely because
 the operator supplied the flag.
 
+If one exit lot was manually closed on both venues and startup now reports
+`startup_reconcile_exchange_position_mismatch`, use the explicit
+`--reconcile-manual-exit` recovery only when the one pending exit lot is fully
+closed, both ETH active-order lists are empty, and both live position quantities
+match the saved lots with that one lot removed. The command makes a state backup,
+removes only that lot and pending action, then continues through normal strict
+startup reconciliation. It records that the manual exit fill prices and
+strategy-ledger PnL are unknown; it does not invent either value. Any mismatch,
+remaining order, or ambiguous pending action stops startup without recovery.
+
+```bash
+python tools/live.py --asset ETH --v4-live --v4-real-gradient \
+  --v4-elastic-capacity --v4-bidirectional --v4-continuous \
+  --v4-test-skip-recent-health --resume-open-position \
+  --reconcile-manual-exit
+```
+
 For routine deployment, request a maintenance drain instead of waiting for a
 multi-cycle batch to finish:
 
