@@ -91,6 +91,8 @@ REASON_LABELS = {
     "basis_exit_lighter_depth_pnl_below_threshold": "Lighter 平仓深度对应收益低于目标",
     "basis_exit_lighter_submit_failed": "Lighter 平仓提交失败",
     "basis_exit_lighter_final_fill_not_confirmed": "Lighter 平仓最终成交未确认",
+    "basis_exit_lighter_recovery_budget_exceeded": "Lighter 平仓超过额外滑点预算",
+    "basis_exit_lighter_retry_position_reconcile_failed": "恢复下单前双边仓位核验未通过",
     "basis_exit_var_exception_pending_reconcile": "Variational 平仓提交异常，等待双边核对",
     "basis_exit_execution_unknown_pending_reconcile": "平仓执行结果未知，等待双边核对",
     "basis_exit_quote_id_missing": "平仓报价缺少报价编号",

@@ -234,6 +234,10 @@ LIVE_INVENTORY_PAIR_SUBMIT_TIMEOUT_SECONDS = 8.0
 # A canceled reduce-only IOC can be retried safely only for its unfilled
 # remainder. Keep this bounded so a changing market cannot create a retry loop.
 LIVE_INVENTORY_LIGHTER_EXIT_MAX_RETRIES = 2
+# After the opposite venue has accepted an exit, permit only a small, fixed
+# price-bound extension to complete the reduce-only hedge if the original cap
+# is no longer marketable. The extension never compounds across retries.
+LIVE_INVENTORY_LIGHTER_EXIT_RECOVERY_EXTRA_SLIPPAGE_BPS = Decimal("6")
 LIVE_INVENTORY_VARIATIONAL_MAINTENANCE_RATE_FALLBACK = Decimal("0.10")
 LIVE_INVENTORY_LIGHTER_MAINTENANCE_RATE_FALLBACK = Decimal("0.012")
 # Only /quotes/indicative calls consume this budget. The last five RFQs are
@@ -14958,6 +14962,79 @@ class VariationalToLighterRuntime:
             ("canceled-", "cancelled-", "canceled_", "cancelled_")
         )
 
+    async def verify_lighter_exit_retry_positions(
+        self,
+        *,
+        asset: str,
+        expected_variational_position_qty: Decimal | None,
+        expected_lighter_position_qty: Decimal | None,
+    ) -> dict[str, Any]:
+        """Require reconciled post-Var and current Lighter state before recovery."""
+        result: dict[str, Any] = {
+            "ok": False,
+            "expected_variational_position_qty": decimal_to_str(
+                expected_variational_position_qty
+            ),
+            "expected_lighter_position_qty": decimal_to_str(
+                expected_lighter_position_qty
+            ),
+        }
+        if (
+            expected_variational_position_qty is None
+            or expected_lighter_position_qty is None
+        ):
+            result["reason"] = "expected_position_unavailable"
+            return result
+
+        reads = await asyncio.gather(
+            self.fetch_variational_positions(),
+            self.fetch_lighter_account(),
+            self.fetch_all_variational_pending_orders(asset=asset),
+            self.fetch_lighter_active_orders(),
+        )
+        var_positions, lighter_account, var_orders, lighter_orders = reads
+        if not isinstance(var_positions, dict) or var_positions.get("ok") is not True:
+            result["reason"] = "variational_positions_unusable"
+            return result
+        var_qtys = self.extract_all_variational_position_qtys(
+            var_positions, asset=asset
+        )
+        lighter_qtys = self.extract_all_lighter_position_qtys(
+            lighter_account, asset=asset
+        )
+        if var_qtys is None or lighter_qtys is None:
+            result["reason"] = "exchange_position_shape_unusable"
+            return result
+
+        actual_var_qty = sum(var_qtys, Decimal("0"))
+        actual_lighter_qty = sum(lighter_qtys, Decimal("0"))
+        result.update(
+            {
+                "actual_variational_position_qty": decimal_to_str(actual_var_qty),
+                "actual_lighter_position_qty": decimal_to_str(actual_lighter_qty),
+                "variational_active_orders": len(var_orders),
+                "lighter_active_orders": len(lighter_orders),
+            }
+        )
+        positions_match = (
+            abs(actual_var_qty - expected_variational_position_qty)
+            <= self.live_inventory_position_qty_tolerance(
+                expected_variational_position_qty
+            )
+            and abs(actual_lighter_qty - expected_lighter_position_qty)
+            <= self.live_inventory_position_qty_tolerance(
+                expected_lighter_position_qty
+            )
+        )
+        if not positions_match:
+            result["reason"] = "exchange_position_mismatch"
+            return result
+        if var_orders or lighter_orders:
+            result["reason"] = "active_orders_remain"
+            return result
+        result.update({"ok": True, "reason": None})
+        return result
+
     async def retry_lighter_exit_after_cancel(
         self,
         *,
@@ -14968,6 +15045,8 @@ class VariationalToLighterRuntime:
         qty: Decimal,
         var_exit_price: Decimal,
         lighter_record: OrderLifecycle,
+        expected_variational_position_qty: Decimal | None,
+        expected_lighter_position_qty_before_exit: Decimal | None,
     ) -> dict[str, Any]:
         """Retry only an explicitly canceled Lighter reduce-only exit."""
         status = str(
@@ -15040,6 +15119,44 @@ class VariationalToLighterRuntime:
                 initial_payload,
             )
 
+        lighter_side = (
+            "BUY" if exit_side.strip().upper() == "SELL" else "SELL"
+        )
+        recovery_delta = (
+            boundary
+            * LIVE_INVENTORY_LIGHTER_EXIT_RECOVERY_EXTRA_SLIPPAGE_BPS
+            / Decimal("10000")
+        )
+        raw_recovery_boundary = (
+            boundary + recovery_delta
+            if lighter_side == "BUY"
+            else boundary - recovery_delta
+        )
+        price_multiplier = to_decimal(
+            getattr(self, "price_multiplier", None)
+        ) or Decimal("1")
+        recovery_rounding = ROUND_DOWN if lighter_side == "BUY" else ROUND_UP
+        recovery_boundary = (
+            (raw_recovery_boundary * price_multiplier).to_integral_value(
+                rounding=recovery_rounding
+            )
+            / price_multiplier
+        )
+        if recovery_boundary <= 0:
+            return failed(
+                "lighter_exit_retry_recovery_boundary_invalid",
+                lighter_record,
+                initial_payload,
+            )
+        context.update(
+            {
+                "recovery_extra_slippage_bps": decimal_to_str(
+                    LIVE_INVENTORY_LIGHTER_EXIT_RECOVERY_EXTRA_SLIPPAGE_BPS
+                ),
+                "recovery_price_boundary": decimal_to_str(recovery_boundary),
+            }
+        )
+
         tolerance = self.live_inventory_position_qty_tolerance(qty)
         total_qty = to_decimal(
             getattr(lighter_record, "lighter_filled_base_amount", None)
@@ -15076,6 +15193,7 @@ class VariationalToLighterRuntime:
                 "filled_qty": decimal_to_str(total_qty),
                 "filled_quote": decimal_to_str(total_quote),
                 "fill_price": decimal_to_str(fill_price),
+                "original_price_boundary": decimal_to_str(boundary),
                 "price_boundary": decimal_to_str(boundary),
             }
         )
@@ -15091,6 +15209,53 @@ class VariationalToLighterRuntime:
                     current_payload,
                 )
 
+            lighter_position_delta = (
+                total_qty
+                if lighter_side == "BUY"
+                else -total_qty
+            )
+            expected_lighter_position_qty = (
+                expected_lighter_position_qty_before_exit + lighter_position_delta
+                if expected_lighter_position_qty_before_exit is not None
+                else None
+            )
+            try:
+                reconciliation = await self.verify_lighter_exit_retry_positions(
+                    asset=asset,
+                    expected_variational_position_qty=(
+                        expected_variational_position_qty
+                    ),
+                    expected_lighter_position_qty=expected_lighter_position_qty,
+                )
+            except Exception as exc:
+                reconciliation = {
+                    "ok": False,
+                    "reason": "exchange_read_failed",
+                    "error": f"{type(exc).__name__}:{exc}",
+                }
+            attempt: dict[str, Any] = {
+                "attempt": retry_index,
+                "remaining_qty": decimal_to_str(remaining_qty),
+                "original_price_boundary": decimal_to_str(boundary),
+                "recovery_price_boundary": decimal_to_str(recovery_boundary),
+                "position_reconciliation": reconciliation,
+            }
+            if not reconciliation.get("ok"):
+                await log_attempt(attempt, "position_reconciliation_failed")
+                context.update(
+                    {
+                        "result": "failed",
+                        "failure_reason": "lighter_exit_retry_position_reconcile_failed",
+                        "total_filled_qty": decimal_to_str(total_qty),
+                        "remaining_qty": decimal_to_str(remaining_qty),
+                    }
+                )
+                return failed(
+                    "lighter_exit_retry_position_reconcile_failed",
+                    current_record,
+                    current_payload,
+                )
+
             try:
                 refresh = await self.refresh_lighter_order_book_for_exit_retry()
             except Exception as exc:
@@ -15099,12 +15264,7 @@ class VariationalToLighterRuntime:
                     "reason": "lighter_market_data_snapshot_request_failed",
                     "error": f"{type(exc).__name__}:{exc}",
                 }
-            attempt: dict[str, Any] = {
-                "attempt": retry_index,
-                "remaining_qty": decimal_to_str(remaining_qty),
-                "price_boundary": decimal_to_str(boundary),
-                "book_refresh": refresh,
-            }
+            attempt["book_refresh"] = refresh
             if not refresh.get("ok"):
                 await log_attempt(attempt, "book_refresh_failed")
                 return failed(
@@ -15113,9 +15273,6 @@ class VariationalToLighterRuntime:
                     current_payload,
                 )
 
-            lighter_side = (
-                "BUY" if exit_side.strip().upper() == "SELL" else "SELL"
-            )
             try:
                 attempt["book_depth"] = await self.estimate_lighter_fill_details(
                     lighter_side,
@@ -15123,6 +15280,63 @@ class VariationalToLighterRuntime:
                 )
             except Exception as exc:
                 attempt["book_depth_error"] = f"{type(exc).__name__}:{exc}"
+
+            depth_estimate = attempt.get("book_depth") or {}
+            estimated_price = to_decimal(
+                depth_estimate.get("estimated_fill_price")
+            )
+            if (
+                not depth_estimate.get("book_depth_sufficient")
+                or estimated_price is None
+            ):
+                await log_attempt(attempt, "book_depth_unavailable")
+                context.update(
+                    {
+                        "result": "failed",
+                        "failure_reason": "lighter_exit_retry_depth_unavailable",
+                        "total_filled_qty": decimal_to_str(total_qty),
+                        "remaining_qty": decimal_to_str(remaining_qty),
+                    }
+                )
+                return failed(
+                    "lighter_exit_retry_depth_unavailable",
+                    current_record,
+                    current_payload,
+                )
+
+            if lighter_side == "BUY":
+                within_original_boundary = estimated_price <= boundary
+                within_recovery_boundary = estimated_price <= recovery_boundary
+            else:
+                within_original_boundary = estimated_price >= boundary
+                within_recovery_boundary = estimated_price >= recovery_boundary
+            if not within_recovery_boundary:
+                attempt["estimated_fill_price"] = decimal_to_str(estimated_price)
+                attempt["estimated_fill_within_recovery_boundary"] = False
+                await log_attempt(attempt, "recovery_budget_exceeded")
+                context.update(
+                    {
+                        "result": "failed",
+                        "failure_reason": "lighter_exit_retry_recovery_budget_exceeded",
+                        "total_filled_qty": decimal_to_str(total_qty),
+                        "remaining_qty": decimal_to_str(remaining_qty),
+                        "estimated_fill_price": decimal_to_str(estimated_price),
+                    }
+                )
+                return failed(
+                    "lighter_exit_retry_recovery_budget_exceeded",
+                    current_record,
+                    current_payload,
+                )
+
+            attempt_boundary = (
+                boundary
+                if within_original_boundary
+                else recovery_boundary
+            )
+            attempt["estimated_fill_price"] = decimal_to_str(estimated_price)
+            attempt["estimated_fill_within_recovery_boundary"] = True
+            attempt["price_boundary"] = decimal_to_str(attempt_boundary)
 
             try:
                 retry_record, retry_payload = await self.place_lighter_order_from_plan(
@@ -15133,7 +15347,7 @@ class VariationalToLighterRuntime:
                     cycle_id=lot_id,
                     role="live_inventory_exit",
                     reduce_only=True,
-                    retry_price_boundary=boundary,
+                    retry_price_boundary=attempt_boundary,
                     retry_index=retry_index,
                 )
             except Exception as exc:
@@ -15223,6 +15437,7 @@ class VariationalToLighterRuntime:
                     "filled_quote": decimal_to_str(retry_quote),
                     "fill_price": decimal_to_str(retry_price),
                     "total_filled_qty": decimal_to_str(total_qty),
+                    "remaining_qty": decimal_to_str(qty - total_qty),
                 }
             )
 
@@ -15239,7 +15454,7 @@ class VariationalToLighterRuntime:
                     retry_record.lighter_filled_base_amount = total_qty
                     retry_record.lighter_filled_quote_amount = total_quote
                     retry_record.lighter_fill_price = total_quote / total_qty
-                    retry_record.lighter_exit_retry_price_boundary = boundary
+                    retry_record.lighter_exit_retry_price_boundary = attempt_boundary
                     retry_record.lighter_exit_retry_index = retry_index
                     retry_record.lighter_exit_retry_history = [
                         dict(item) for item in context["attempts"]
@@ -15257,6 +15472,7 @@ class VariationalToLighterRuntime:
                         "successful_retry_index": retry_index,
                         "total_filled_qty": decimal_to_str(total_qty),
                         "total_filled_quote": decimal_to_str(total_quote),
+                        "remaining_qty": decimal_to_str(qty - total_qty),
                     }
                 )
                 return {
@@ -15276,6 +15492,12 @@ class VariationalToLighterRuntime:
                 )
             await log_attempt(attempt, "retryable_cancel")
 
+        context.update(
+            {
+                "total_filled_qty": decimal_to_str(total_qty),
+                "remaining_qty": decimal_to_str(max(Decimal("0"), qty - total_qty)),
+            }
+        )
         return failed(
             "lighter_exit_retry_exhausted",
             current_record,
@@ -18058,6 +18280,9 @@ class VariationalToLighterRuntime:
         config[
             "live_inventory_lighter_exit_max_retries"
         ] = str(LIVE_INVENTORY_LIGHTER_EXIT_MAX_RETRIES)
+        config[
+            "live_inventory_lighter_exit_recovery_extra_slippage_bps"
+        ] = str(LIVE_INVENTORY_LIGHTER_EXIT_RECOVERY_EXTRA_SLIPPAGE_BPS)
         await self.append_live_inventory_log("live_inventory_run_config", {"config": config})
         if getattr(self, "live_inventory_basis_v4_mode", False):
             await self.append_live_inventory_log(
@@ -25470,6 +25695,31 @@ class VariationalToLighterRuntime:
                 )
                 return
             if not await self.wait_for_lighter_final_fill(lighter_record):
+                expected_var_before_exit = Decimal("0")
+                local_position_known = isinstance(
+                    self.live_inventory_open_lots, list
+                )
+                if local_position_known:
+                    for open_lot in self.live_inventory_open_lots:
+                        if not isinstance(open_lot, dict):
+                            local_position_known = False
+                            break
+                        open_qty = to_decimal(open_lot.get("qty"))
+                        open_direction = str(open_lot.get("direction") or "")
+                        if open_qty is None or open_qty < 0 or open_direction not in {
+                            "long_var_short_lighter",
+                            "short_var_long_lighter",
+                        }:
+                            local_position_known = False
+                            break
+                        expected_var_before_exit += (
+                            open_qty
+                            if open_direction == "long_var_short_lighter"
+                            else -open_qty
+                        )
+                var_exit_delta = (
+                    qty if exit_side.strip().upper() == "BUY" else -qty
+                )
                 retry_result = await self.retry_lighter_exit_after_cancel(
                     asset=asset,
                     direction=direction,
@@ -25478,6 +25728,14 @@ class VariationalToLighterRuntime:
                     qty=qty,
                     var_exit_price=var_exit_price,
                     lighter_record=lighter_record,
+                    expected_variational_position_qty=(
+                        expected_var_before_exit + var_exit_delta
+                        if local_position_known
+                        else None
+                    ),
+                    expected_lighter_position_qty_before_exit=(
+                        -expected_var_before_exit if local_position_known else None
+                    ),
                 )
                 retry_context = retry_result.get("context") or {}
                 retry_record = retry_result.get("record")
@@ -25492,6 +25750,20 @@ class VariationalToLighterRuntime:
                     if retry_record is not None:
                         lighter_record = retry_record
                         lighter_payload = retry_result.get("payload") or retry_record.to_payload()
+                    retry_failure_reason = str(
+                        retry_context.get("failure_reason") or ""
+                    )
+                    manual_review_reason = {
+                        "lighter_exit_retry_recovery_budget_exceeded": (
+                            "basis_exit_lighter_recovery_budget_exceeded"
+                        ),
+                        "lighter_exit_retry_position_reconcile_failed": (
+                            "basis_exit_lighter_retry_position_reconcile_failed"
+                        ),
+                    }.get(
+                        retry_failure_reason,
+                        "basis_exit_lighter_final_fill_not_confirmed",
+                    )
                     pending_exit_match.context = {
                         **(pending_exit_match.context or {}),
                         "submitted_at": utc_now(),
@@ -25504,12 +25776,13 @@ class VariationalToLighterRuntime:
                     )
                     await self.require_live_inventory_manual_review(
                         asset=asset,
-                        reason="basis_exit_lighter_final_fill_not_confirmed",
+                        reason=manual_review_reason,
                         context={
-                            "action": "manual_confirm_or_flatten_after_var_exit",
+                            "action": "verify_both_exchange_positions_before_manual_reduce_only_recovery",
                             "lot_id": lot.get("lot_id"),
                             "direction": direction,
                             "qty": decimal_to_str(qty),
+                            "var_result": var_result,
                             "lighter_payload": lighter_payload,
                             "lighter_record": lighter_record.to_payload(),
                             "lighter_exit_retry": retry_context,

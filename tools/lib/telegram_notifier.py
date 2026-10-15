@@ -512,16 +512,56 @@ def format_telegram_trade_message(
         "live_inventory_manual_review_required",
         "live_inventory_loss_review_alert",
     }:
-        return "\n".join(
-            [
-                "[Var/Lighter] 需要人工核对",
-                f"资产：{asset}｜原因：{_reason_cn(_value(payload, 'reason'))}",
-                f"当前预计亏损：{_value(payload, 'pnl_bps')} bps｜提醒阈值：{_value(payload, 'threshold_bps')} bps",
-                f"本地未平仓层数：{_value(payload, 'open_lots_total')}",
-                "动作：不自动止损；暂停新开仓和加仓，现有仓位继续按正常退出条件管理",
-                f"运行编号：{run_id}",
-            ]
-        )
+        lines = [
+            "[Var/Lighter] 需要人工核对",
+            f"资产：{asset}｜原因：{_reason_cn(_value(payload, 'reason'))}",
+            f"当前预计亏损：{_value(payload, 'pnl_bps')} bps｜提醒阈值：{_value(payload, 'threshold_bps')} bps",
+            f"本地未平仓层数：{_value(payload, 'open_lots_total')}",
+        ]
+        review_context = payload.get("manual_review_context")
+        if not isinstance(review_context, dict):
+            review_context = {}
+        retry = review_context.get("lighter_exit_retry")
+        if isinstance(retry, dict):
+            lines.extend(
+                [
+                    "Lighter 平仓恢复："
+                    f"已成交 {_value(retry, 'total_filled_qty')} {asset}，"
+                    f"剩余 {_value(retry, 'remaining_qty')} {asset}",
+                    "原价格边界："
+                    f"{_value(retry, 'initial_price_boundary')}；恢复上限："
+                    f"{_value(retry, 'recovery_price_boundary')}",
+                    "盘口预计成交价："
+                    f"{_value(retry, 'estimated_fill_price')}；"
+                    f"恢复预算 {_value(retry, 'recovery_extra_slippage_bps')} bps",
+                ]
+            )
+            attempts = retry.get("attempts")
+            last_attempt = attempts[-1] if isinstance(attempts, list) and attempts else {}
+            reconciliation = (
+                last_attempt.get("position_reconciliation")
+                if isinstance(last_attempt, dict)
+                else None
+            )
+            if isinstance(reconciliation, dict):
+                lines.append(
+                    "平仓前双边核验：Var "
+                    f"{_value(reconciliation, 'actual_variational_position_qty')} / "
+                    f"预期 {_value(reconciliation, 'expected_variational_position_qty')} {asset}；"
+                    "RH "
+                    f"{_value(reconciliation, 'actual_lighter_position_qty')} / "
+                    f"预期 {_value(reconciliation, 'expected_lighter_position_qty')} {asset}；"
+                    "活动单 Var/RH "
+                    f"{_value(reconciliation, 'variational_active_orders')}/"
+                    f"{_value(reconciliation, 'lighter_active_orders')}"
+                )
+            lines.append("动作：策略已停止；先核对两边实仓和未成交单，再手动处理剩余仓位")
+        else:
+            lines.append(
+                "动作：不自动止损；暂停新开仓和加仓，现有仓位继续按正常退出条件管理"
+            )
+        lines.append(f"运行编号：{run_id}")
+        return "\n".join(lines)
     if event_type == "live_inventory_runtime_fuse_triggered":
         return "\n".join(
             [

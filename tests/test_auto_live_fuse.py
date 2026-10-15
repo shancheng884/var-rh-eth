@@ -9302,6 +9302,7 @@ def test_v4_exit_pair_preserves_one_leg_exception_outcome(tmp_path) -> None:
 def test_lighter_exit_retries_canceled_remainder_without_alert_spam(tmp_path) -> None:
     async def run() -> None:
         runtime = _live_inventory_runtime(tmp_path)
+        runtime.price_multiplier = Decimal("100")
         initial = OrderLifecycle(
             trade_key="initial-exit",
             trade_id="initial-exit",
@@ -9339,6 +9340,19 @@ def test_lighter_exit_retries_canceled_remainder_without_alert_spam(tmp_path) ->
                 "update_at": "2999-06-02T08:50:12+00:00",
             }
 
+        estimate_prices = iter(("2000.50", "1999.99"))
+
+        async def fake_estimate(_side, _quantity):
+            return {
+                "book_depth_sufficient": True,
+                "estimated_fill_price": next(estimate_prices),
+            }
+
+        async def fake_verify(**kwargs):
+            assert kwargs["expected_variational_position_qty"] == Decimal("0")
+            assert kwargs["expected_lighter_position_qty"] == Decimal("0.006")
+            return {"ok": True, "reason": None}
+
         async def fake_place(**kwargs):
             place_calls.append(kwargs)
             attempt = len(place_calls)
@@ -9366,14 +9380,16 @@ def test_lighter_exit_retries_canceled_remainder_without_alert_spam(tmp_path) ->
                 return False
             record.lighter_order_status = "filled"
             record.lighter_filled_base_amount = Decimal("0.00600")
-            record.lighter_filled_quote_amount = Decimal("12.0600")
-            record.lighter_fill_price = Decimal("2010.00")
+            record.lighter_filled_quote_amount = Decimal("12.0030")
+            record.lighter_fill_price = Decimal("2000.50")
             record.lighter_fill_ts_iso = "2026-09-17T00:00:02+00:00"
             record.processing_stage = "lighter_filled"
             return True
 
         runtime.append_order_log = fake_append_order_log
         runtime.refresh_lighter_order_book_for_exit_retry = fake_refresh
+        runtime.estimate_lighter_fill_details = fake_estimate
+        runtime.verify_lighter_exit_retry_positions = fake_verify
         runtime.place_lighter_order_from_plan = fake_place
         runtime.wait_for_lighter_final_fill = fake_wait
         runtime.telegram_notifier = FakeNotifier()
@@ -9386,6 +9402,8 @@ def test_lighter_exit_retries_canceled_remainder_without_alert_spam(tmp_path) ->
             qty=Decimal("0.01000"),
             var_exit_price=Decimal("1999.00"),
             lighter_record=initial,
+            expected_variational_position_qty=Decimal("0"),
+            expected_lighter_position_qty_before_exit=Decimal("0.01"),
         )
 
         assert result["ok"] is True
@@ -9395,24 +9413,22 @@ def test_lighter_exit_retries_canceled_remainder_without_alert_spam(tmp_path) ->
             Decimal("0.00600"),
         ]
         assert all(call["reduce_only"] is True for call in place_calls)
-        assert all(
-            call["retry_price_boundary"] == Decimal("2000.00")
-            for call in place_calls
-        )
+        assert [
+            call["retry_price_boundary"] for call in place_calls
+        ] == [Decimal("2000.00"), Decimal("1998.80")]
         assert [call["retry_index"] for call in place_calls] == [1, 2]
 
         record = result["record"]
         assert record.lighter_filled_base_amount == Decimal("0.01000")
-        assert record.lighter_filled_quote_amount == Decimal("20.0600")
-        assert record.lighter_fill_price == Decimal("2006")
-        assert record.lighter_exit_retry_price_boundary == Decimal("2000.00")
+        assert record.lighter_filled_quote_amount == Decimal("20.0030")
+        assert record.lighter_fill_price == Decimal("2000.3")
+        assert record.lighter_exit_retry_price_boundary == Decimal("1998.80")
         assert [
             item["attempt"] for item in record.lighter_exit_retry_history
         ] == [0, 1, 2]
-        assert all(
-            item["price_boundary"] == "2000.00"
-            for item in record.lighter_exit_retry_history
-        )
+        assert [
+            item["price_boundary"] for item in record.lighter_exit_retry_history
+        ] == ["2000.00", "2000.00", "1998.8"]
         assert [
             payload["result"] for _, payload in logged_events
         ] == ["retryable_cancel", "filled_after_retry"]
@@ -9422,6 +9438,130 @@ def test_lighter_exit_retries_canceled_remainder_without_alert_spam(tmp_path) ->
             "canceled-too-much-slippage"
         ) is True
         assert runtime.lighter_exit_cancel_is_retryable("expired") is False
+
+    asyncio.run(run())
+
+
+def test_lighter_exit_retry_stops_when_recovery_budget_is_exceeded(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        runtime.price_multiplier = Decimal("100")
+        initial = OrderLifecycle(
+            trade_key="initial-exit",
+            trade_id="initial-exit",
+            side="sell",
+            qty=Decimal("0.01000"),
+            asset="ETH",
+            mode="live",
+            last_variational_status="submitted",
+            lighter_client_order_id=100,
+            lighter_order_status="canceled-too-much-slippage",
+            lighter_filled_base_amount=Decimal("0"),
+            lighter_reduce_only=True,
+            dry_run_plan_price=Decimal("2000.00"),
+        )
+        submissions = []
+
+        async def fake_verify(**_kwargs):
+            return {"ok": True, "reason": None}
+
+        async def fake_refresh():
+            return {"ok": True, "snapshot_received": True}
+
+        async def fake_estimate(_side, _quantity):
+            return {
+                "book_depth_sufficient": True,
+                "estimated_fill_price": "2002.00",
+            }
+
+        async def fake_place(**kwargs):
+            submissions.append(kwargs)
+            raise AssertionError("must not submit beyond recovery budget")
+
+        runtime.verify_lighter_exit_retry_positions = fake_verify
+        runtime.refresh_lighter_order_book_for_exit_retry = fake_refresh
+        runtime.estimate_lighter_fill_details = fake_estimate
+        runtime.place_lighter_order_from_plan = fake_place
+
+        result = await runtime.retry_lighter_exit_after_cancel(
+            asset="ETH",
+            direction="long_var_short_lighter",
+            lot_id=9,
+            exit_side="SELL",
+            qty=Decimal("0.01000"),
+            var_exit_price=Decimal("1999.00"),
+            lighter_record=initial,
+            expected_variational_position_qty=Decimal("0"),
+            expected_lighter_position_qty_before_exit=Decimal("-0.01"),
+        )
+
+        assert result["ok"] is False
+        assert result["reason"] == "lighter_exit_retry_recovery_budget_exceeded"
+        assert result["context"]["recovery_price_boundary"] == "2001.2"
+        assert result["context"]["estimated_fill_price"] == "2002.00"
+        assert submissions == []
+
+    asyncio.run(run())
+
+
+def test_lighter_exit_retry_position_reconciliation_fails_closed(tmp_path) -> None:
+    async def run() -> None:
+        runtime = _live_inventory_runtime(tmp_path)
+        var_qty = "0.01"
+        lighter_qty = "0.01"
+        var_active_orders = []
+
+        async def fake_variational_positions():
+            return {
+                "ok": True,
+                "result": {"positions": [{"asset": "ETH", "qty": var_qty}]},
+            }
+
+        async def fake_lighter_account():
+            return {
+                "accounts": [
+                    {
+                        "positions": [
+                            {"symbol": "ETH", "position": lighter_qty, "sign": -1}
+                        ]
+                    }
+                ]
+            }
+
+        async def fake_var_orders(*, asset):
+            assert asset == "ETH"
+            return var_active_orders
+
+        async def fake_lighter_orders():
+            return []
+
+        runtime.fetch_variational_positions = fake_variational_positions
+        runtime.fetch_lighter_account = fake_lighter_account
+        runtime.fetch_all_variational_pending_orders = fake_var_orders
+        runtime.fetch_lighter_active_orders = fake_lighter_orders
+
+        result = await runtime.verify_lighter_exit_retry_positions(
+            asset="ETH",
+            expected_variational_position_qty=Decimal("0"),
+            expected_lighter_position_qty=Decimal("0"),
+        )
+
+        assert result["ok"] is False
+        assert result["reason"] == "exchange_position_mismatch"
+        assert result["actual_variational_position_qty"] == "0.01"
+        assert result["actual_lighter_position_qty"] == "-0.01"
+
+        var_qty = "0"
+        lighter_qty = "0"
+        var_active_orders = [{"status": "open"}]
+        result = await runtime.verify_lighter_exit_retry_positions(
+            asset="ETH",
+            expected_variational_position_qty=Decimal("0"),
+            expected_lighter_position_qty=Decimal("0"),
+        )
+        assert result["ok"] is False
+        assert result["reason"] == "active_orders_remain"
+        assert result["variational_active_orders"] == 1
 
     asyncio.run(run())
 

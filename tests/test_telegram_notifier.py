@@ -439,6 +439,47 @@ def test_telegram_account_recovery_wait_is_chinese() -> None:
     assert "连续账户检查已通过" in recovered
 
 
+def test_telegram_lighter_exit_recovery_alert_shows_caps_and_position_check() -> None:
+    message = format_telegram_trade_message(
+        "live_inventory_manual_review_required",
+        {
+            "asset": "ETH",
+            "reason": "basis_exit_lighter_recovery_budget_exceeded",
+            "run_id": "liveinv-test",
+            "open_lots_total": 9,
+            "manual_review_context": {
+                "lighter_exit_retry": {
+                    "initial_price_boundary": "2360.66",
+                    "recovery_price_boundary": "2362.07",
+                    "recovery_extra_slippage_bps": "6",
+                    "estimated_fill_price": "2362.25",
+                    "total_filled_qty": "0",
+                    "remaining_qty": "0.00820",
+                    "attempts": [
+                        {
+                            "position_reconciliation": {
+                                "actual_variational_position_qty": "0.1000",
+                                "expected_variational_position_qty": "0.1000",
+                                "actual_lighter_position_qty": "-0.0918",
+                                "expected_lighter_position_qty": "-0.1000",
+                                "variational_active_orders": 0,
+                                "lighter_active_orders": 0,
+                            }
+                        }
+                    ],
+                }
+            },
+        },
+    )
+
+    assert "原因：Lighter 平仓超过额外滑点预算" in message
+    assert "已成交 0 ETH，剩余 0.00820 ETH" in message
+    assert "原价格边界：2360.66；恢复上限：2362.07" in message
+    assert "盘口预计成交价：2362.25；恢复预算 6 bps" in message
+    assert "活动单 Var/RH 0/0" in message
+    assert "策略已停止；先核对两边实仓和未成交单" in message
+
+
 def test_telegram_account_risk_throttle_distinguishes_risk_reasons() -> None:
     notifier = TelegramNotifier(
         bot_token="secret-token",
